@@ -412,9 +412,34 @@ What it is worth, graphs held at `full`, same slope measurement as `bench.py`:
 | `eager` | 12.46 | 80.28 |
 | **`inductor`** | **10.55** | **94.76** |
 
-**1.18x**, and the fastest decode recorded on this card. That is much more than
-the "pointwise fusion against a 2.8% slice" argument predicts, so where it comes
-from has not been established — this is a measurement, not yet an explanation.
+**1.18x**, and the fastest decode recorded on this card.
+
+Where it comes from, by `profile_decode.py --backend none` against
+`--backend inductor` (graph capture off in both, since it collapses the kernel
+boundaries this reads):
+
+| | eager | inductor |
+|---|---|---|
+| total device time | 414.2 ms | 358.9 ms |
+| kernel launches | 37,818 | **15,716** |
+| cuBLAS GEMV | 154.1 ms | 154.0 ms |
+| exllama quantized GEMM | 149.0 ms | 148.6 ms |
+| attention + GDN + conv1d | 29.9 ms | 28.8 ms |
+
+Every GEMM is untouched, which is the point: inductor does not go near the two
+kernels that own 73% of the time. What disappears is the small stuff around
+them. `unrolled_elementwise_kernel` alone was 20.8 ms across **5,466** launches;
+with the reductions, the rsqrt, `act_and_mul` and half a dozen flavours of
+`vectorized_elementwise`, roughly 80 ms of elementwise and reduction traffic
+becomes about 10 ms of `triton_poi_fused_*` and `triton_red_fused_*`. Launches
+more than halve.
+
+So the earlier guess was wrong twice over. The 2.8% figure recorded above
+answers "is attention the bottleneck", and reusing it to predict fusion headroom
+was a category error: the fusable traffic was never attention, it was the ~20%
+of device time sitting in "everything else" behind the GEMMs. Fewer launches
+also matters here for the same reason CUDA graphs did — at 12 ms/step there is
+not much step to hide launch overhead in.
 
 Not bit-identical, and it should not be expected to be: fusion reassociates
 reductions. Against the eager path's own greedy output, worst prefix agreement
@@ -424,10 +449,17 @@ the disagreement moves between runs, which is what autotuning picking different
 configs looks like. Late divergence on a near-tie is what the gate already
 tolerates; an early one would not be.
 
-Not wired in. `get_compile_backend()` returns `simple_compile_backend`, which is
-pinned to `eager` here, so inductor has to be asked for explicitly. Turning it on
-by default means owning the patches at import and re-verifying every model, and
-that is a larger change than the probe that justifies it.
+**On by default**, in `vllm/platforms/cuda.py` alongside the existing sm_70
+block. The two attributes are deliberately split: `simple_compile_backend` stays
+`eager`, because that is what the fourteen `@torch.compile` helper sites read and
+nothing measured says they need inductor, while `get_compile_backend()` — which
+is what the *model* compile resolves through — returns `inductor`. Set
+`VLLM_PASCAL_INDUCTOR=0` to go back.
+
+Verified with the default path, no explicit `compilation_config`: the gate model
+reports `backend: inductor`, zero ptxas errors, 94.88 tok/s at 10.54 ms/step,
+and greedy output matching the eager reference; `Qwen2.5-1.5B-Instruct-FP8-dynamic`
+likewise loads and generates correctly.
 
 ## Model coverage
 
@@ -456,7 +488,7 @@ correct text on the GTX 1070 Ti, and MTP speculative decoding works.
 | Weights on GPU | 1.83 GiB (1.88 with MTP) |
 | KV cache | 3.7 GiB / **173,494 tokens** |
 | Attention backend | `TRITON_ATTN` |
-| Compile backend | `eager` |
+| Compile backend | `inductor` (helpers stay `eager`; `VLLM_PASCAL_INDUCTOR=0` reverts) |
 | Quantized GEMM | `ExllamaLinearKernel` |
 
 ### Performance
@@ -467,7 +499,9 @@ Decode throughput, batch 1, measured by `pascal/scripts/bench.py`:
 |---|---|---|---|
 | as ported | 55.34 | 18.07 | — |
 | fp32 `dot22_8_f` | 32.00 | 31.25 | 1.73× |
-| **+ fp32 int4 dequant** | **13.73** | **72.82** | **4.03×** |
+| + fp32 int4 dequant | 13.73 | 72.82 | 4.03× |
+| + CUDA graphs (`full`) | 12.37 | 80.82 | 4.47× |
+| **+ inductor** | **10.54** | **94.88** | **5.25×** |
 
 Both changes are the same finding applied twice: `__hfma2` runs at 1/56 the
 fp32 rate on this card (`pascal/probes/fp16_rate.cu`), and the exllama GEMM --

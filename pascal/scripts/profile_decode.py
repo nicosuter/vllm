@@ -29,7 +29,14 @@ PROMPT = "Explain how a CPU scheduler decides which thread to run next."
 
 
 def run_profile(model: str, out_dir: str, max_tokens: int,
-                dtype: str = "auto") -> None:
+                dtype: str = "auto", backend: str = "none") -> None:
+    if backend == "inductor":
+        # Same lift the probe uses, so there is one definition of it.
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "probes"))
+        from inductor_sm61 import lift_inductor_floor
+
+        lift_inductor_floor()
+
     from vllm import LLM, SamplingParams
     from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
 
@@ -50,7 +57,13 @@ def run_profile(model: str, out_dir: str, max_tokens: int,
         trust_remote_code=True,
         limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0},
         compilation_config=CompilationConfig(
-            mode=CompilationMode.NONE,
+            # Graph capture stays off in every arm: it collapses the kernel
+            # boundaries this script exists to read.
+            mode=(
+                CompilationMode.NONE if backend == "none"
+                else CompilationMode.VLLM_COMPILE
+            ),
+            backend=("" if backend == "none" else backend),
             cudagraph_mode=CUDAGraphMode.NONE,
         ),
         profiler_config={"profiler": "torch", "torch_profiler_dir": out_dir},
@@ -134,6 +147,13 @@ def main() -> int:
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--dtype", default="auto")
     ap.add_argument(
+        "--backend",
+        default="none",
+        choices=["none", "eager", "inductor"],
+        help="compile backend to profile; inductor lifts the sm_70 floor first "
+        "(see pascal/probes/inductor_sm61.py)",
+    )
+    ap.add_argument(
         "--summarize-only",
         action="store_true",
         help="skip the run and re-read the newest trace in --out-dir",
@@ -142,7 +162,8 @@ def main() -> int:
 
     os.makedirs(args.out_dir, exist_ok=True)
     if not args.summarize_only:
-        run_profile(args.model, args.out_dir, args.max_tokens, args.dtype)
+        run_profile(args.model, args.out_dir, args.max_tokens, args.dtype,
+                    args.backend)
     return summarize(args.out_dir, args.top)
 
 

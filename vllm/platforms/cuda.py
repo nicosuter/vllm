@@ -1031,7 +1031,57 @@ try:
 except Exception:  # noqa: BLE001 - no device, or NVML unavailable
     _compile_capability = None
 
+
+def _lift_inductor_floor_below_sm70() -> bool:
+    """Make inductor usable below sm_70. Returns whether it took.
+
+    The floor is three `major >= 7` checks in torch, and behind them a single
+    real obstacle: inductor asks for cache-eviction hints on loads, and ptxas
+    rejects `.evict_last` / `.evict_first` below sm_70. Those hints are
+    advisory -- they tell L1 what to discard first and change no result -- so
+    dropping them at Triton's frontend costs a cache hint and nothing else.
+    `pascal/probes/inductor_sm61.py` establishes both halves on the card.
+    """
+    try:
+        import torch.utils._triton as triton_utils
+        from torch._dynamo.device_interface import CudaInterface
+        from triton.language import semantic as tl_semantic
+    except ImportError:  # no triton, or a torch that has moved these
+        return False
+
+    triton_utils.has_triton = lambda: True
+    CudaInterface.is_triton_capable = staticmethod(lambda device=None: True)
+    tl_semantic.TritonSemantic._str_to_eviction_policy = lambda self, eviction_policy: (
+        tl_semantic.ir.EVICTION_POLICY.NORMAL
+    )
+
+    # Inductor compiles in worker subprocesses, which do not inherit the patch
+    # above: 108 ptxas errors become 12 rather than 0. Forked workers do
+    # inherit it, and that beats serialising compilation with
+    # TORCHINDUCTOR_COMPILE_THREADS=1. setdefault, so an explicit choice wins.
+    os.environ.setdefault("TORCHINDUCTOR_WORKER_START", "fork")
+    return True
+
+
 if _compile_capability is not None and _compile_capability.to_int() < 70:
+    # Standalone @torch.compile helpers stay on eager. Nothing measured says
+    # they need inductor -- they are small and compiled at import -- and the
+    # fourteen sites above are what this attribute exists for.
     CudaPlatform.simple_compile_backend = "eager"
+
+    # The model is a different question, and worth 1.18x: 10.55 ms/step against
+    # 12.46 with graphs held at full, the fastest decode measured on this card.
+    # get_compile_backend() otherwise returns simple_compile_backend, which
+    # would keep the model on eager along with the helpers.
+    #
+    # Opt out with VLLM_PASCAL_INDUCTOR=0. Inductor fuses, so it reassociates
+    # reductions and is not bit-identical to eager -- worst greedy prefix
+    # agreement measured at 97%, one token of 32 on one prompt, and the
+    # position moves between runs as autotuning picks different configs.
+    if (
+        os.environ.get("VLLM_PASCAL_INDUCTOR", "1") != "0"
+        and _lift_inductor_floor_below_sm70()
+    ):
+        CudaPlatform.get_compile_backend = classmethod(lambda cls: "inductor")
 
 CudaPlatform.log_warnings()
