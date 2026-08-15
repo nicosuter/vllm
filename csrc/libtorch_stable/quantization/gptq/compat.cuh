@@ -59,6 +59,21 @@ __device__ __forceinline__ void atomicAdd(half2* address, half2 val) {
   #endif
 #endif
 
+// GP102/104/106/107 (sm_61) and GP10B (sm_62) have a single FP16x2 unit per SM.
+// pascal/probes/fp16_rate.cu measures __hfma2 on a GTX 1070 Ti at 139.9 GFLOP/s
+// against 7844.7 GFLOP/s for fmaf -- a ratio of 1/56 -- so native half2 is the
+// slowest available way to do arithmetic on this hardware.
+//
+// GP100 (sm_60) is deliberately excluded: it has genuine 2x fp16 throughput and
+// wants the half2 paths. This is why the guard names the two architectures
+// rather than testing __CUDA_ARCH__ < 700.
+//
+// Defined here because both q_gemm.cu and qdq_4.cuh need it, and compat.cuh is
+// included before qdq_4.cuh by every translation unit that uses either.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 610 || __CUDA_ARCH__ == 620)
+  #define VLLM_GPTQ_SLOW_NATIVE_FP16 1
+#endif
+
 }  // namespace gptq
 }  // namespace vllm
 #endif

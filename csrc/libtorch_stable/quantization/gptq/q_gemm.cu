@@ -127,6 +127,24 @@ __forceinline__ __device__ half2 dot22_32(half2 (&dq)[16], const half* a_ptr,
   return __hfma2(result, __halves2half2(qs_h, qs_h), g_result);
 }
 
+#ifdef VLLM_GPTQ_SLOW_NATIVE_FP16
+// Companion to dequant_4bit_8_gptq_f: the weights already arrive as fp32, so
+// only the activations need converting. Same contract as dot22_8_f -- eight
+// consecutive activations against eight dequantized weights, fp32 accumulator.
+__forceinline__ __device__ float dot8_f(const float (&dq)[8],
+                                        const half* a_ptr) {
+  const half2* a2_ptr = (const half2*)a_ptr;
+  float result = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float2 a = __half22float2(a2_ptr[i]);
+    result = fmaf(dq[2 * i], a.x, result);
+    result = fmaf(dq[2 * i + 1], a.y, result);
+  }
+  return result;
+}
+#endif
+
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
                                            const float g_result,
                                            const float qs_f) {
@@ -277,14 +295,25 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
   // Initial group
   int zeros[4];
   float scales[4];
+#ifdef VLLM_GPTQ_SLOW_NATIVE_FP16
+  // The fp32 dequant folds the zero point into a plain float, so the packed
+  // half2 constants z1z16/y1y16 are not needed at all.
+  float zerof[4];
+#else
   half2 z1z16[4][2];
   half2 y1y16[4][2];
+#endif
   b_gptq_qzeros_.item4(zeros, group, n);
   b_gptq_scales_.item4_f(scales, group, n);
+#ifdef VLLM_GPTQ_SLOW_NATIVE_FP16
+  #pragma unroll
+  for (int i = 0; i < 4; i++) zerof[i] = (float)(zeros[i] + zero_offset);
+#else
   dequant_4bit_8_prep_zero(zeros[0] + zero_offset, z1z16[0], y1y16[0]);
   dequant_4bit_8_prep_zero(zeros[1] + zero_offset, z1z16[1], y1y16[1]);
   dequant_4bit_8_prep_zero(zeros[2] + zero_offset, z1z16[2], y1y16[2]);
   dequant_4bit_8_prep_zero(zeros[3] + zero_offset, z1z16[3], y1y16[3]);
+#endif
 
   // Column result
   float block_c[m_count][4] = {};
@@ -297,10 +326,15 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
       nextgroup += groupsize;
       b_gptq_qzeros_.item4(zeros, group, n);
       b_gptq_scales_.item4_f(scales, group, n);
+#ifdef VLLM_GPTQ_SLOW_NATIVE_FP16
+  #pragma unroll
+      for (int i = 0; i < 4; i++) zerof[i] = (float)(zeros[i] + zero_offset);
+#else
       dequant_4bit_8_prep_zero(zeros[0] + zero_offset, z1z16[0], y1y16[0]);
       dequant_4bit_8_prep_zero(zeros[1] + zero_offset, z1z16[1], y1y16[1]);
       dequant_4bit_8_prep_zero(zeros[2] + zero_offset, z1z16[2], y1y16[2]);
       dequant_4bit_8_prep_zero(zeros[3] + zero_offset, z1z16[3], y1y16[3]);
+#endif
     }
 
 #pragma unroll
@@ -308,6 +342,25 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
       const int4* b_ptr4 = (int4*)b_ptr;
       int4 load_int4 = *b_ptr4;
 
+#ifdef VLLM_GPTQ_SLOW_NATIVE_FP16
+      float dq[4][8];
+      dequant_4bit_8_gptq_f(load_int4.x, dq[0], zerof[0]);
+      dequant_4bit_8_gptq_f(load_int4.y, dq[1], zerof[1]);
+      dequant_4bit_8_gptq_f(load_int4.z, dq[2], zerof[2]);
+      dequant_4bit_8_gptq_f(load_int4.w, dq[3], zerof[3]);
+
+  #pragma unroll
+      for (int m = 0; m < m_count; m++) {
+        block_c[m][0] =
+            fma(dot8_f(dq[0], a_ptr + m * a_stride), scales[0], block_c[m][0]);
+        block_c[m][1] =
+            fma(dot8_f(dq[1], a_ptr + m * a_stride), scales[1], block_c[m][1]);
+        block_c[m][2] =
+            fma(dot8_f(dq[2], a_ptr + m * a_stride), scales[2], block_c[m][2]);
+        block_c[m][3] =
+            fma(dot8_f(dq[3], a_ptr + m * a_stride), scales[3], block_c[m][3]);
+      }
+#else
       half2 dq[4][4];
       dequant_4bit_8_gptq(load_int4.x, dq[0], z1z16[0], y1y16[0], size_n,
                           false);
@@ -318,7 +371,7 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
       dequant_4bit_8_gptq(load_int4.w, dq[3], z1z16[3], y1y16[3], size_n,
                           false);
 
-#pragma unroll
+  #pragma unroll
       for (int m = 0; m < m_count; m++) {
         block_c[m][0] = fma(dot22_8_f(dq[0], a_ptr + m * a_stride), scales[0],
                             block_c[m][0]);
@@ -329,6 +382,7 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
         block_c[m][3] = fma(dot22_8_f(dq[3], a_ptr + m * a_stride), scales[3],
                             block_c[m][3]);
       }
+#endif
 
       b_ptr += size_n;
       a_ptr += 8;
