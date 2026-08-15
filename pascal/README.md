@@ -341,6 +341,44 @@ Fourteen sites read `current_platform.simple_compile_backend` at import time to
 decorate functions, so the fix belongs on the platform, once:
 `CudaPlatform.simple_compile_backend = "eager"` below sm_70.
 
+### Dropping `enforce_eager` — what actually blocked it, and what it was worth
+
+Inductor is what has the sm_70 floor. Dynamo does not, so `VLLM_COMPILE` without
+inductor is tracing only and should run here. What stopped it was narrower: two
+**raw Triton launches inside the traced region**. vLLM compiles with
+`fullgraph=True`, so neither could graph-break, and both reached
+`triton/runtime/jit.py`'s `driver.active.get_current_stream(device)` — whose
+`_cuda_getCurrentRawStream` returns an `int`, which dynamo will not put in a
+graph:
+
+| Site | Reached via |
+|---|---|
+| `RMSNormGated.forward_cuda` → flash-linear-attention's `rmsnorm_fn` | Gated DeltaNet's output projection |
+| `MRotaryEmbedding.forward_cuda` → `triton_mrope` | 2-D positions, i.e. multimodal rope |
+
+Both are now registered with `direct_register_custom_op`, so dynamo emits one
+opaque call and never sees the launch. Above sm_70 inductor owns Triton launches
+and emits that stream call itself, which is why nobody upstream meets this.
+`layernorm_guard.py` records that the FLA kernel used to sit behind an
+`autograd.Function` that dynamo would not trace into, and that the wrapper was
+removed as inference-only — removing it is what exposed the launch.
+
+The gate model now runs without `enforce_eager` and produces output **identical
+token for token** to the eager path.
+
+**It buys nothing.** With graphs held at `full`, on the gate model:
+
+| | ms/step | decode tok/s |
+|---|---|---|
+| `mode=NONE` | 12.37 | 80.82 |
+| `mode=VLLM_COMPILE` | 12.46 | 80.27 |
+
+Tracing without a compiler backend has nothing to optimise, so this is a
+correctness fix and not a performance one — `enforce_eager` is no longer
+*needed*, rather than newly worth dropping. The +10.5% above is CUDA graphs,
+which never involved the compiler at all. `bench.py --compile` exists to keep
+that separable.
+
 ## Model coverage
 
 Which checkpoints run on this card, and why the ones that do not fail:

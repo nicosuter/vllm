@@ -5,15 +5,17 @@ tok/s is arithmetic and how much is kernel-launch overhead. Every v1 measurement
 was taken with `--enforce-eager`, which disables torch.compile *and* CUDA
 graphs. Those are separable, and only the first is actually impossible here:
 
-  * `mode` selects torch.compile. Anything but NONE routes through inductor,
-    which raises GPUTooOldForTriton below sm_70 regardless of what Triton
-    itself supports.
+  * `mode` selects torch.compile. Inductor is what raises GPUTooOldForTriton
+    below sm_70; VLLM_COMPILE without it is dynamo tracing only, and that does
+    run here -- but only since the raw Triton launches inside the traced region
+    were moved behind custom ops. Before that it died in dynamo, which is why
+    every earlier measurement here pinned mode=NONE.
   * `cudagraph_mode` selects graph capture, which is pure launch-overhead
     elimination and involves no compiler at all.
 
-So the interesting configuration is mode=NONE with graphs on. PIECEWISE is not
-reachable -- it needs splitting_ops from piecewise compilation, i.e. inductor --
-which leaves FULL and FULL_DECODE_ONLY.
+The two are independent, so `--compile` varies the first and `--graphs` the
+second. PIECEWISE is not reachable -- it needs splitting_ops from piecewise
+compilation, i.e. inductor -- which leaves FULL and FULL_DECODE_ONLY.
 
 Throughput is measured by slope rather than by dividing tokens by wall time.
 A single generate() call also pays prefill, sampler setup and detokenisation,
@@ -45,14 +47,12 @@ PROMPT = (
 
 
 def build_llm(model: str, graphs: str, mtp: int, gpu_frac: float,
-              dtype: str = "auto"):
+              dtype: str = "auto", compile_model: bool = False):
     from vllm import LLM
     from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
 
-    # mode=NONE unconditionally: inductor cannot run on this hardware, so the
-    # only variable under test is graph capture.
     compilation_config = CompilationConfig(
-        mode=CompilationMode.NONE,
+        mode=CompilationMode.VLLM_COMPILE if compile_model else CompilationMode.NONE,
         cudagraph_mode={
             "none": CUDAGraphMode.NONE,
             "full": CUDAGraphMode.FULL,
@@ -196,6 +196,12 @@ def main() -> int:
         choices=["none", "full", "full_decode_only"],
         help="cudagraph modes to measure; one engine is built per mode",
     )
+    ap.add_argument(
+        "--compile",
+        action="store_true",
+        help="run mode=VLLM_COMPILE instead of NONE; dynamo tracing without "
+        "inductor, which is all this card can do",
+    )
     ap.add_argument("--mtp", type=int, default=0)
     ap.add_argument("--gpu-frac", type=float, default=0.85)
     ap.add_argument("--dtype", default="auto")
@@ -224,7 +230,8 @@ def main() -> int:
         print(f"\n{'=' * 72}\ncudagraph_mode={graphs}  mtp={args.mtp}\n{'=' * 72}",
               flush=True)
         try:
-            llm = build_llm(args.model, graphs, args.mtp, args.gpu_frac, args.dtype)
+            llm = build_llm(args.model, graphs, args.mtp, args.gpu_frac, args.dtype,
+                            args.compile)
             # One engine serves every batch size, since only the request shape
             # differs; rebuilding per batch would pay engine init each time.
             if len(args.batch) == 1:

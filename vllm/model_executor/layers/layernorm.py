@@ -12,6 +12,7 @@ from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -286,25 +287,83 @@ class RMSNormGated(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
-        from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
-            rmsnorm_fn,
-        )
-
-        return rmsnorm_fn(
+        return torch.ops.vllm.gated_rmsnorm(
             x,
             self.weight,
             self.bias,
-            z=z,
-            eps=self.eps,
-            group_size=self.group_size,
-            norm_before_gate=self.norm_before_gate,
-            activation=self.activation,
+            z,
+            self.eps,
+            self.group_size,
+            self.norm_before_gate,
+            self.activation,
         )
 
     def forward_xpu(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.forward_cuda(x, z)
+
+
+def _gated_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    z: torch.Tensor | None,
+    eps: float,
+    group_size: int | None,
+    norm_before_gate: bool,
+    activation: str,
+) -> torch.Tensor:
+    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+        rmsnorm_fn,
+    )
+
+    return rmsnorm_fn(
+        x,
+        weight,
+        bias,
+        z=z,
+        eps=eps,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        activation=activation,
+    )
+
+
+def _gated_rmsnorm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    z: torch.Tensor | None,
+    eps: float,
+    group_size: int | None,
+    norm_before_gate: bool,
+    activation: str,
+) -> torch.Tensor:
+    # rmsnorm_fn allocates with empty_like and restores the original shape, so
+    # the result matches x in both.
+    return torch.empty_like(x)
+
+
+# RMSNormGated launches a Triton kernel from flash-linear-attention directly.
+# That used to sit behind an autograd.Function, which dynamo would not trace
+# into; layernorm_guard.py removed the wrapper because vLLM is inference-only,
+# and doing so exposed the launch to the tracer. vLLM compiles with
+# fullgraph=True, so the launch cannot graph-break either -- it reaches
+# triton/runtime/jit.py's `driver.active.get_current_stream(device)`, whose
+# _cuda_getCurrentRawStream returns an int, and dynamo refuses a non-Tensor in
+# the graph output.
+#
+# Registering it as a custom op is the fix rather than a flag: dynamo emits one
+# opaque call and never sees the launch. Only models with Gated DeltaNet layers
+# reach this at all, which is why Qwen3.5 needed enforce_eager here and models
+# without them did not.
+direct_register_custom_op(
+    op_name="gated_rmsnorm",
+    op_func=_gated_rmsnorm,
+    mutates_args=[],
+    fake_impl=_gated_rmsnorm_fake,
+)
 
 
 class LayerNorm(nn.Module):

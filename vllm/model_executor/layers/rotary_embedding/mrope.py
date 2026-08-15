@@ -7,6 +7,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .base import RotaryEmbeddingBase
 from .yarn_scaling_rope import YaRNScalingRotaryEmbedding, yarn_get_mscale
@@ -181,19 +182,46 @@ def triton_mrope(
         is_neox_style: Whether rotary pairs use split-half (NeoX) or
             adjacent (GPT-J) layout.
     """
-    n_row, n_q_head_head_dim = q.shape
-    n_q_head = n_q_head_head_dim // head_size
-    n_kv_head = k.shape[1] // head_size
-    pad_rd = triton.next_power_of_2(rotary_dim)
-    pad_n_q_head = triton.next_power_of_2(n_q_head)
-    pad_n_kv_head = triton.next_power_of_2(n_kv_head)
-
     # ensure tensors passed into the kernel are contiguous.
     # It will be no-op if they are already contiguous
     q = q.contiguous()
     k = k.contiguous()
     cos = cos.contiguous()
     sin = sin.contiguous()
+
+    # The launch itself lives behind a custom op so dynamo never traces into it;
+    # see the note on _mrope_forward_inplace below.
+    torch.ops.vllm.mrope_forward_inplace(
+        q,
+        k,
+        cos,
+        sin,
+        mrope_section,
+        head_size,
+        rotary_dim,
+        mrope_interleaved,
+        is_neox_style,
+    )
+    return q, k
+
+
+def _mrope_forward_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    mrope_section: list[int],
+    head_size: int,
+    rotary_dim: int,
+    mrope_interleaved: bool,
+    is_neox_style: bool,
+) -> None:
+    n_row, n_q_head_head_dim = q.shape
+    n_q_head = n_q_head_head_dim // head_size
+    n_kv_head = k.shape[1] // head_size
+    pad_rd = triton.next_power_of_2(rotary_dim)
+    pad_n_q_head = triton.next_power_of_2(n_q_head)
+    pad_n_kv_head = triton.next_power_of_2(n_kv_head)
 
     # Small adjacent-pair tiles perform best with one wave per program on
     # ROCm. Keep the existing launch shape for larger rotary dimensions,
@@ -220,7 +248,39 @@ def triton_mrope(
         is_neox_style,
         num_warps=num_warps,
     )
-    return q, k
+
+
+def _mrope_forward_inplace_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    mrope_section: list[int],
+    head_size: int,
+    rotary_dim: int,
+    mrope_interleaved: bool,
+    is_neox_style: bool,
+) -> None:
+    return None
+
+
+# The kernel writes q and k in place and returns nothing, so the op declares the
+# mutation rather than returning tensors that alias its inputs. Contiguity is
+# forced by the caller, which keeps the mutation landing on the same tensors the
+# caller goes on to use -- the behaviour the plain function already had.
+#
+# It is registered as a custom op because vLLM compiles with fullgraph=True: a
+# raw Triton launch inside the traced region reaches
+# triton/runtime/jit.py's `driver.active.get_current_stream(device)`, and
+# _cuda_getCurrentRawStream returns an int, which dynamo will not put in a graph.
+# Above sm_70 inductor owns the launch and emits that call itself, so the defect
+# only surfaces where inductor is unavailable.
+direct_register_custom_op(
+    op_name="mrope_forward_inplace",
+    op_func=_mrope_forward_inplace,
+    mutates_args=["q", "k"],
+    fake_impl=_mrope_forward_inplace_fake,
+)
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
