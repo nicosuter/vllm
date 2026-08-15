@@ -1,0 +1,64 @@
+# Long-lived build/test pod for the Pascal fork.
+#
+# It sleeps rather than running a build as its entrypoint, because compiling
+# vLLM is an iterative activity: the first pass finds the kernels that will not
+# compile for sm_61, and each fix should cost an `exec` rather than a fresh pod
+# and another full toolchain install. The PVC carries ccache and the build tree
+# across pod restarts.
+#
+# The GPU is attached so the same pod can run the model after building it. There
+# is exactly one Pascal card in this cluster, so holding it here is fine.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pascal-build
+  namespace: vllm-pascal
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: <storage-class>
+  resources:
+    requests:
+      storage: 80Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pascal-build
+  namespace: vllm-pascal
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  nodeSelector:
+    kubernetes.io/hostname: <node>
+  containers:
+    - name: build
+      # CUDA 12.6 devel: the last toolkit line that still emits sm_61 code.
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      env:
+        - name: TORCH_CUDA_ARCH_LIST
+          value: "6.1"
+        - name: CCACHE_DIR
+          value: /work/.ccache
+        - name: CMAKE_BUILD_PARALLEL_LEVEL
+          value: "8"
+        # nvcc peaks around 2 GB per translation unit; 8 jobs against the
+        # node's 24 GB is the most this box will take without swapping.
+        - name: MAX_JOBS
+          value: "8"
+        - name: HF_HOME
+          value: /work/hf
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          memory: 18Gi
+        requests:
+          cpu: "8"
+          memory: 12Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+  volumes:
+    - name: work
+      persistentVolumeClaim:
+        claimName: pascal-build

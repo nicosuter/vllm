@@ -128,7 +128,12 @@ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
 else()
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0")
+  # 6.1 (Pascal / GP104) is this fork's reason to exist. CUDA 13 dropped sm_61
+  # codegen, so it can only appear on this branch, which is the CUDA <12.8 one.
+  # Kernel families needing newer hardware already select themselves out via
+  # cuda_archs_loose_intersection, so widening the list here does not force
+  # Marlin, Machete, CUTLASS SM80+ or the FP8 paths to try to build.
+  set(CUDA_SUPPORTED_ARCHS "6.1;7.0;7.5;8.0;8.6;8.7;8.9;9.0")
 endif()
 
 #
