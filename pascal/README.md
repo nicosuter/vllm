@@ -11,8 +11,8 @@ easy to re-apply over a future upstream tag, not for being continuously merged.
 `cyankiwi/Qwen3.5-2B-AWQ-4bit` generates correct text on a GTX 1070 Ti, with MTP
 speculative decoding working.
 
-- **v1 — correctness.** Text-only. Output must be coherent and must agree
-  numerically with an HF transformers reference on the same prompts.
+- **v1 — correctness.** Text-only. Output must be coherent, and the kernels must
+  agree numerically with independent implementations of the same mathematics.
 - **v2 — speed, and image input.** Both are commitments, not maybes.
 
 ## Fork layout
