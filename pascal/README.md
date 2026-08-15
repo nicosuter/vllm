@@ -251,4 +251,28 @@ short-context compromise that an 8 GB card seems to imply. At 2.4 GB of INT4
 weights, the card has room to spare — including for the v2 vision tower.
 
 First startup is slow (many minutes) because Triton autotunes and compiles every
-kernel for sm_61. The cache lives on the PVC, so later starts skip it.
+kernel for sm_61. The cache lives on the PVC, so later starts skip it — but it is
+shape-specialized, so changing batch/sequence shapes pays part of it again.
+
+### Kernel correctness
+
+Coherent text is not proof: a miscompiled kernel usually still reads fine. Each
+kernel is therefore checked against an independent implementation of the same
+mathematics (`pascal/probes/kernel_check.py`):
+
+```
+w4a16.triton_vs_fp32_dequant  PASS  rel_err=3.918e-04  (M=8 K=2048 N=512 group=128)
+gdn.chunked_vs_recurrent      PASS  rel_err=8.591e-04  (T=128 H=4 K=64 V=64)
+```
+
+Both are at fp16 rounding. The first covers every linear layer in the model —
+the kernel Pascal reaches only because Marlin and Machete opt out. The second is
+a real cross-check rather than a kernel compared against itself, since prefill
+uses the chunked form and decode the recurrent one.
+
+The originally intended check, greedy decoding under HF transformers on CPU in
+fp32, is unavailable: transformers rejects this checkpoint with `strategy group
+requires group_size to be set to a positive value`, a disagreement between the
+checkpoint's `quantization_config` and the installed `compressed-tensors`
+validation. That is a library-version problem on the reference side and says
+nothing about Pascal.

@@ -96,10 +96,12 @@ def _w4a16():
     w_deq = (qweight.float() - zeros[g_idx].float()) * scales[g_idx].float()
     ref = x.float() @ w_deq
 
-    # Pack 8 int4 values per int32, low nibble first, matching the kernel layout.
-    packed = torch.zeros((K // 8, N), device="cuda", dtype=torch.int32)
+    # Packing runs along N, not K: b_q is [K, N//8] and qzeros is [K//G, N//8],
+    # eight 4-bit values per int32, low nibble first. This is why
+    # can_implement() requires the *output* features to be divisible by 8.
+    packed = torch.zeros((K, N // 8), device="cuda", dtype=torch.int32)
     for i in range(8):
-        packed |= (qweight[i::8].to(torch.int32) & 0xF) << (4 * i)
+        packed |= (qweight[:, i::8].to(torch.int32) & 0xF) << (4 * i)
     packed_zeros = torch.zeros((n_groups, N // 8), device="cuda", dtype=torch.int32)
     for i in range(8):
         packed_zeros |= (zeros[:, i::8].to(torch.int32) & 0xF) << (4 * i)
@@ -141,8 +143,19 @@ def _gdn():
     def unwrap(o):
         return o[0] if isinstance(o, tuple) else o
 
-    chunked = unwrap(chunk_gated_delta_rule(q, k, v, g, beta))
-    recurrent = unwrap(fused_recurrent_gated_delta_rule(q, k, v, g, beta))
+    # Both forms start from the same (zero) recurrent state. The recurrent form
+    # requires it explicitly; passing None reaches a .stride(0) on it.
+    h0 = torch.zeros(B, H, V, K, device="cuda", dtype=torch.float32)
+
+    chunked = unwrap(chunk_gated_delta_rule(q, k, v, g, beta, initial_state=h0))
+    # inplace_final_state must be off: that branch indexes ssm_state_indices,
+    # which serving supplies per request but a standalone call does not, and the
+    # resulting null reaches Triton as a codegen error rather than a Python one.
+    recurrent = unwrap(
+        fused_recurrent_gated_delta_rule(
+            q, k, v, g, beta, initial_state=h0, inplace_final_state=False
+        )
+    )
     torch.cuda.synchronize()
 
     if not torch.isfinite(chunked).all():
@@ -161,11 +174,6 @@ def _gdn():
 @check("attention.triton_vs_sdpa")
 def _attn():
     """Triton attention against torch SDPA on the same inputs."""
-    try:
-        from vllm.attention.ops.triton_unified_attention import unified_attention
-    except ImportError as exc:
-        raise Skip(f"triton unified attention not importable ({exc})") from exc
-
     torch.manual_seed(0)
     # Qwen3.5-2B: 8 query heads, 2 kv heads, head_dim 256.
     T, HQ, HKV, D = 64, 8, 2, 256
