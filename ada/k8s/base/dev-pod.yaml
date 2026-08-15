@@ -1,0 +1,78 @@
+# Long-lived dev/measurement pod for the Ada branch.
+#
+# One GPU, because the target deployment is single-card. It mounts the model
+# read-only from a claim the overlay names: on a cluster already serving this
+# model there is a 48Gi PVC holding it, and re-downloading 16 GiB into a second
+# volume to measure the same weights would be silly.
+#
+# That claim is almost certainly ReadWriteOnce, which means this pod and the
+# serving deployment cannot hold it at once. Scaling the deployment to zero is
+# therefore required for the volume as well as for the GPU -- see README.md.
+#
+# The image is the stock vLLM release: every open hypothesis here is
+# Python-level, and the per-kind attention split can be tested through
+# configuration before any patch exists.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ada-dev
+  namespace: vllm-ada
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 40Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ada-dev
+  namespace: vllm-ada
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  containers:
+    - name: dev
+      image: vllm/vllm-openai:v0.27.1-x86_64
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      env:
+        - name: TORCH_CUDA_ARCH_LIST
+          value: "8.9"
+        # Gemma4 forces Triton attention, so first use JITs and autotunes a
+        # kernel per shape. Parking the cache on the PVC keeps a pod restart
+        # from re-paying it, and keeps JIT out of profile traces where it would
+        # swamp every real kernel.
+        - name: TRITON_CACHE_DIR
+          value: /work/.triton
+        - name: VLLM_CACHE_ROOT
+          value: /work/.vllm
+        - name: HF_HOME
+          value: /work/hf
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          memory: 20Gi
+        requests:
+          cpu: "8"
+          memory: 12Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: models
+          mountPath: /models
+          readOnly: true
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: work
+      persistentVolumeClaim:
+        claimName: ada-dev
+    # Re-pointed by the overlay at whatever claim already holds the checkpoint.
+    - name: models
+      persistentVolumeClaim:
+        claimName: REPLACE_ME_MODELS_CLAIM
+        readOnly: true
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 4Gi

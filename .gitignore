@@ -260,3 +260,6 @@ ampere/k8s/local/
 
 # oh-my-claudecode runtime state (never belongs in the repo)
 .omc/
+
+# Cluster-specific kustomize overlay for the Ada branch (see ada/k8s/README.md)
+ada/k8s/local/

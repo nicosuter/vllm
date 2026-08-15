@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Copy this directory to `ada/k8s/local/` (gitignored) and fill in the
+# REPLACE_ME_ values. Then:
+#
+#     kubectl create namespace vllm-ada
+#     kubectl apply -k ada/k8s/local
+#
+# Node names, storage classes, namespaces and claim names describe one
+# cluster, not this fork, which is why none of them are in base/.
+
+resources:
+  - ../base
+
+namespace: vllm-ada
+
+patches:
+  # Pin to the node holding the Ada card. nvidia.com/gpu does not distinguish
+  # architectures, so without this the scheduler may land the pod on an Ampere
+  # or Pascal node and every sm_89 conclusion drawn from it is wrong.
+  - target:
+      kind: Pod
+      name: ada-dev
+    patch: |-
+      - op: add
+        path: /spec/nodeSelector
+        value:
+          kubernetes.io/hostname: REPLACE_ME_NODE_NAME
+      # The claim that already holds the checkpoint. Usually ReadWriteOnce, so
+      # the serving deployment must be scaled to zero first.
+      - op: replace
+        path: /spec/volumes/1/persistentVolumeClaim/claimName
+        value: REPLACE_ME_MODELS_CLAIM
+
+  - target:
+      kind: PersistentVolumeClaim
+      name: ada-dev
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: REPLACE_ME_STORAGE_CLASS
