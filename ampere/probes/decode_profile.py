@@ -148,11 +148,20 @@ def run_profile(args: argparse.Namespace) -> None:
     # measure a model nobody serves, but it is worth being able to turn off:
     # with spec decode on, one "step" is three draft forwards plus a target
     # forward, and attributing device time per generated token gets murky.
+    spec_cfg = {"method": "mtp", "num_speculative_tokens": args.spec_tokens}
+    if args.attn_backend:
+        # Both target and drafter, or the escapee forces PIECEWISE for the whole
+        # model -- min_cg_support is a minimum across attention groups. Pass the
+        # enum, not a string: AttentionBackendEnum is a plain Enum and silently
+        # ignores one, which has already produced a probe comparing a
+        # configuration against itself.
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        backend = AttentionBackendEnum[args.attn_backend]
+        kwargs["attention_config"] = {"backend": backend}
+        spec_cfg["attention_backend"] = backend
     if args.spec_tokens > 0:
-        kwargs["speculative_config"] = {
-            "method": "mtp",
-            "num_speculative_tokens": args.spec_tokens,
-        }
+        kwargs["speculative_config"] = spec_cfg
 
     llm = LLM(**kwargs)
 
@@ -307,6 +316,11 @@ def main() -> int:
     ap.add_argument("--out-dir", default="/work/profile")
     ap.add_argument("--tp", type=int, default=2)
     ap.add_argument("--spec-tokens", type=int, default=3)
+    ap.add_argument(
+        "--attn-backend",
+        default=None,
+        help="force both target and drafter, e.g. TRITON_ATTN; default auto",
+    )
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--prompt-tokens", type=int, default=0)
     ap.add_argument("--top", type=int, default=25)

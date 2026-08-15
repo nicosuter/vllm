@@ -13,16 +13,19 @@ quantized layers.
 
 ## Two traps, both walked into while writing this
 
-**L2 is 72 MB on a 4090.** Any weight matrix smaller than that is served from
-cache on the second iteration of a benchmark loop, and the numbers are nonsense:
-26 MB of int4 "read" in 11.2 us is 2.3 TB/s, more than twice the card's HBM
-bandwidth. Every shape in Gemma4 is far below 72 MB, so benchmarking the model's
-own shapes measures cache. In the model they still stream from HBM, because a
-layer's weights are evicted long before that layer runs again. So the shapes
-here are deliberately much larger than the model's, to put the working set past
-L2 where HBM bandwidth is what is being measured. The cuBLAS control makes the
-boundary visible: it reports 1400-2238 GB/s below 72 MB and settles to 952-956
-above it.
+**L2 is huge on a 4090 -- 72 MiB, larger than every weight matrix in Gemma4.**
+Any weight smaller than that is served from cache on the second iteration of a
+benchmark loop, and the numbers are nonsense: 26 MB of int4 "read" in 11.2 us is
+2.3 TB/s, more than twice the card's HBM bandwidth. In the model those weights
+still stream from HBM, because a layer's weights are evicted long before that
+layer runs again. So the shapes here are deliberately much larger than the
+model's. The cuBLAS control makes the boundary visible: it reports 1400-2238
+GB/s below L2 and settles to 952-956 above it.
+
+L2 size is queried, never hardcoded: a 4090 has 72 MiB and a 3090 Ti has 6 MiB,
+so a constant for either mislabels the other. An earlier version assumed the
+4090's and told the 3090 Ti that a 67 MB working set was cache-resident when it
+was not.
 
 **Synchronising per iteration measures the launch, not the kernel.** The first
 version timed one call between two events and synchronised each time. It
@@ -38,9 +41,16 @@ from __future__ import annotations
 import argparse
 import sys
 
-# L2 on a 4090. Anything at or below this is cache-resident under a benchmark
-# loop and its bandwidth number is meaningless.
-L2_BYTES = 72 * 1024 * 1024
+
+# Anything at or below L2 is cache-resident under a benchmark loop and its
+# bandwidth number is meaningless. This is emphatically not a constant: a 4090
+# has 72 MiB, a 3090 Ti has 6 MiB, so hardcoding either mislabels the other.
+# Query the device rather than assume.
+def _l2_bytes() -> int:
+    import torch
+
+    return torch.cuda.get_device_properties(0).L2_cache_size
+
 
 # Deliberately larger than any shape in Gemma4, to get past L2. K is the
 # reduction dim, N the output dim.
@@ -95,7 +105,8 @@ def main() -> int:
     dtype = torch.float16
     qtype = scalar_types.uint4b8  # symmetric int4
     ws = marlin_make_workspace_new(dev)
-    print(f"{torch.cuda.get_device_name(0)}, L2 = {L2_BYTES / 1024**2:.0f} MiB")
+    l2 = _l2_bytes()
+    print(f"{torch.cuda.get_device_name(0)}, L2 = {l2 / 1024**2:.0f} MiB")
     print("Shapes below are much larger than Gemma4's on purpose: smaller ones")
     print("sit in L2 and report bandwidth the memory system cannot deliver.\n")
 
@@ -140,7 +151,7 @@ def main() -> int:
             )
 
         ms = bench(call, args.iters)
-        cached = " (IN L2 -- ignore)" if nbytes <= L2_BYTES else ""
+        cached = " (IN L2 -- ignore)" if nbytes <= l2 else ""
         print(
             f"    {K:>6} {N:>7} {nbytes / 1e6:8.1f} {ms * 1000:9.1f} "
             f"{nbytes / 1e6 / ms:7.0f}{cached}"
@@ -159,7 +170,7 @@ def main() -> int:
             return torch.nn.functional.linear(a, w)
 
         ms = bench(call, args.iters)
-        cached = " (IN L2 -- ignore)" if nbytes <= L2_BYTES else ""
+        cached = " (IN L2 -- ignore)" if nbytes <= l2 else ""
         print(
             f"    {K:>6} {N:>7} {nbytes / 1e6:8.1f} {ms * 1000:9.1f} "
             f"{nbytes / 1e6 / ms:7.0f}{cached}"
