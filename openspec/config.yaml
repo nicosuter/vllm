@@ -1,0 +1,49 @@
+schema: spec-driven
+
+context: |
+  vllm-pascal — a one-off hard fork of vLLM that runs modern model paths on
+  Pascal (SM 6.1) GPUs. This is deliberately NOT a maintained track of upstream:
+  it is shipped once and refreshed rarely, only when a new model family is
+  wanted. Prefer changes that are easy to re-apply over a future upstream tag.
+
+  Fork base: vLLM v0.27.1 (upstream commit 6e448d0ea9), branch `pascal`.
+  Upstream remains as the `upstream` remote so the tree can be rebased later.
+  Our own additions live under `pascal/` so they stay identifiable inside the
+  vendored tree; edits to vLLM's own files are made in place.
+
+  Green gate: `cyankiwi/Qwen3.5-2B-AWQ-4bit` generates correct text on a
+  GTX 1070 Ti with MTP speculative decoding working.
+
+  Target hardware: single GTX 1070 Ti (GP104, SM 6.1, 8 GB VRAM) in node
+  <node> of the <cluster> Kubernetes cluster (Talos, driver 580.167.08).
+  Schedule GPU work with `runtimeClassName: nvidia` and
+  `nodeSelector: kubernetes.io/hostname: <node>`.
+
+  Hardware constraints that drive nearly every design decision:
+    - No tensor cores. FlashAttention, FlashInfer, Marlin, Machete, CUTLASS
+      SM80+ and every FP8 path are unavailable and must be compiled out.
+    - No bfloat16 at all. Everything runs fp16 storage with fp32 compute.
+    - GP104 executes native fp16 arithmetic (HFMA2) at 1/64 rate, so fp16 must
+      never be the compute type; it is a storage format only.
+    - INT8 dp4a/dp2a IS available on SM 6.1 and is the fast path worth reaching
+      for in the v2 performance work.
+    - CUDA 13 dropped sm_61 codegen, so the toolkit is pinned to CUDA 12.6 and
+      torch to the cu126 wheel channel, the last one shipping Pascal cubins.
+
+  Scope discipline:
+    - v1 is correctness only. Speed is v2, and v2 is a commitment, not a maybe.
+    - v1 is text-only. Image input is v2, and the vision tower is expected to
+      land there, so do not make choices that foreclose it.
+
+rules:
+  proposal:
+    - State which hardware constraint forces the change; "Pascal is old" is not a reason.
+    - Record evidence from a real run on the 1070 Ti, not reasoning about what should happen.
+  tasks:
+    - Every task that touches a kernel must name how it will be verified numerically.
+
+operations:
+  apply:
+    guidance:
+      - Prefer deleting an unsupported code path over adding a Pascal-specific branch beside it.
+      - When upstream already gates on device capability, extend that gate rather than adding a new one.

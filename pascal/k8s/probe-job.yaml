@@ -1,0 +1,58 @@
+# Runs pascal/probes/triton_probe.py on the GTX 1070 Ti in <node>.
+#
+# The probe script is injected via ConfigMap rather than baked into an image so
+# that iterating on it costs a kubectl apply instead of a container build. Torch
+# is installed at pod start from the cu126 index: that is the only PyTorch build
+# channel that still ships Maxwell/Pascal/Volta cubins ("5.0;6.0;7.0;...").
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm-pascal
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: triton-probe
+  namespace: vllm-pascal
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: <node>
+      containers:
+        - name: probe
+          # Full python image, not -slim: Triton compiles a small C driver shim
+          # at first use, so it needs a working toolchain present at runtime.
+          image: python:3.12
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --quiet --root-user-action=ignore \
+                --index-url https://download.pytorch.org/whl/cu126 \
+                "torch==${TORCH_VERSION}"
+              cc --version | head -1
+              python /probe/triton_probe.py
+          env:
+            # Pinned deliberately: this is the newest torch with a cu126 build,
+            # and cu126 is the last channel carrying Pascal cubins.
+            - name: TORCH_VERSION
+              value: "2.13.0"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              memory: 12Gi
+            requests:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: probe
+              mountPath: /probe
+      volumes:
+        - name: probe
+          configMap:
+            name: triton-probe-src
