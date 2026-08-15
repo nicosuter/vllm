@@ -16,7 +16,10 @@ apt-get update -qq
 # Ubuntu's cargo (1.75) cannot parse vLLM's workspace manifest, which uses
 # resolver = "3" and needs cargo >= 1.84, so it is deliberately not installed
 # here; rustup provides the toolchain below.
-apt-get install -y -qq python3.12 python3.12-venv python3-pip git ccache cmake ninja-build curl >/dev/null
+# protobuf-compiler: the Rust vllm-server crate builds prost definitions and
+# fails with "Could not find protoc" without it.
+apt-get install -y -qq python3.12 python3.12-venv python3-pip git ccache cmake \
+  ninja-build curl protobuf-compiler >/dev/null
 
 echo "==> rust toolchain (rustup, not apt)"
 export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo"

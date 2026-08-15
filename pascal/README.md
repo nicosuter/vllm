@@ -144,3 +144,47 @@ Four conclusions, all of which shrink the project:
 
 Triton needs a C toolchain at runtime to build its driver shim, which is why the
 probe image is `python:3.12` and not `-slim`.
+
+## Building
+
+```bash
+kubectl apply -f pascal/k8s/build-pod.yaml
+kubectl -n vllm-pascal exec -i pascal-build -- bash -s < pascal/scripts/setup-build-env.sh
+kubectl -n vllm-pascal exec -i pascal-build -- bash -s < pascal/scripts/build.sh
+```
+
+`TORCH_CUDA_ARCH_LIST=6.1` does more than pick codegen: it is what makes CMake
+and `setup.py` drop FlashAttention, Marlin, Machete, CUTLASS SM80+, QuTLASS and
+the FP8 paths, since each already selects itself out by target arch.
+
+### What the fork had to change to compile
+
+| Change | Why |
+|---|---|
+| `CUDA_SUPPORTED_ARCHS` gains `6.1` | The CUDA<12.8 branch is the only one that can carry it; CUDA 13 dropped sm_61 codegen |
+| MoE W4A16 fp16 path compiled out below sm_70 | `atomicAdd(__half*)` is sm_70+. Upstream already does this for bf16 below sm_80, so it extends that guard |
+| vllm-flash-attn subproject skipped | FA2 is sm_80+, FA3 sm_90+. ~200 dead translation units, and the selector falls through to Triton on ImportError |
+| `setup.py` FA extensions gated the same way | Otherwise `cmake --build` is asked for `_vllm_fa2_C`, which CMake never defined |
+| `requirements/pascal.txt` replaces `cuda.txt` | `cuda.txt` pins torch from the default index (cu128, no Pascal cubins) and pulls flashinfer, tilelang and two cu13-only CUTLASS packages |
+
+Environment gotchas, all encoded in `setup-build-env.sh`:
+
+- Ubuntu 24.04's cargo is 1.75; vLLM's workspace manifest needs `resolver = "3"`,
+  so rustup is required.
+- The Rust `vllm-server` crate builds prost definitions and needs `protoc`.
+- `setuptools-scm` derives the version from git, so a tarball checkout needs a
+  seeded repo and tag or the build aborts before compiling anything.
+
+### How the quantized path resolves on Pascal
+
+The gate model is compressed-tensors W4A16, asymmetric, group size 128. Marlin
+is sm_75+, Machete sm_90, CUTLASS W4A8 sm_90 — none available. But
+`TritonW4A16LinearKernel` reports `get_min_capability() == 0` ("Triton handles
+capability checks itself") and accepts `scalar_types.uint4` (asymmetric with
+explicit zeros) at group sizes `[-1, 32, 64, 128, 256]`. So the checkpoint's
+exact quantization lands on a Triton kernel that we have measured working on
+this card.
+
+Attention resolves the same way: `TritonAttentionBackend.supports_compute_capability`
+returns `True` unconditionally, and `gdn_attn` handles the 18 Gated DeltaNet
+layers.
