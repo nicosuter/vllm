@@ -257,3 +257,6 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 
 # Cluster-specific kustomize overlay for the Ampere branch (see ampere/k8s/README.md)
 ampere/k8s/local/
+
+# oh-my-claudecode runtime state (never belongs in the repo)
+.omc/
