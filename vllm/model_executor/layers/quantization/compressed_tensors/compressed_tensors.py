@@ -114,7 +114,17 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 70
+        # Coarse, config-level floor checked once in VllmConfig before any
+        # layer is built. It has to be the minimum over the schemes this config
+        # can produce, not over the common ones: wNa16 now runs on Pascal
+        # through the Triton W4A16 kernel.
+        #
+        # Nothing is lost by relaxing it. Every scheme is still checked
+        # individually via _check_scheme_supported(scheme.get_min_capability())
+        # when the layer's scheme is resolved, so an fp8 or W8A8 checkpoint on
+        # this hardware still fails — just with an error naming the scheme that
+        # is actually unsupported rather than the container format.
+        return 60
 
     def get_name(self) -> QuantizationMethods:
         return "compressed-tensors"

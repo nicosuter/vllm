@@ -96,8 +96,17 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Turing and up
-        return 75
+        # 75 here meant "Turing and up" from the era when Marlin was the only
+        # way to run wNa16. It is now the floor of one candidate kernel rather
+        # than of the scheme: TritonW4A16LinearKernel reports
+        # get_min_capability() == 0 and covers uint4/uint4b8 at group sizes
+        # [-1, 32, 64, 128, 256], which is what a Pascal card selects.
+        #
+        # Kernel choice is still guarded per candidate, so lowering this does
+        # not let Marlin (75), Machete (90) or CUTLASS W4A8 (90) run on
+        # hardware that cannot host them; it only stops the scheme from being
+        # rejected before that choice is ever made.
+        return 60
 
     def create_weights(
         self,

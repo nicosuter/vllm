@@ -8,11 +8,14 @@
 # PyTorch channel still shipping Maxwell/Pascal/Volta cubins:
 #
 #   pip install --index-url https://download.pytorch.org/whl/cu126 \
-#       torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0
+#       torch==2.13.0 torchvision==0.28.0
 #   pip install -r requirements/pascal.txt
 #
-# torch is deliberately NOT listed below so that resolving this file can never
-# quietly pull a non-Pascal build over the one that was installed on purpose.
+# torch and torchvision are deliberately NOT listed below so that resolving this
+# file can never quietly pull a non-Pascal build over the ones installed on
+# purpose. torchvision is not optional even for text-only serving: the Qwen3.5
+# model module imports qwen3_vl, which imports transformers' Qwen2VL image
+# processor, which imports torchvision at module scope.
 
 -r common.txt
 

@@ -20,11 +20,37 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
-        compile_flash_attn_varlen_func_from_specs,
-        flash_attn_varlen_func,
-        get_scheduler_metadata,
-    )
+
+    try:
+        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+            compile_flash_attn_varlen_func_from_specs,
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+        )
+    except ImportError:
+        # FA2 is sm_80+ and FA3 is sm_90+, so a Pascal-targeted build has no
+        # flash-attention extension to import. This module must still import:
+        # vllm.model_executor.layers.attention pulls it in unconditionally, so
+        # a hard failure here makes every model architecture uninspectable and
+        # the engine refuses to start at all.
+        #
+        # Bind call-time stubs instead, mirroring what the ROCm branch below
+        # already does when upstream flash-attn is absent. Nothing reaches them
+        # in practice: FlashAttentionBackend.supports_compute_capability rejects
+        # this hardware and the selector falls through to Triton.
+        _FA_MISSING = (
+            "FlashAttention is unavailable in this build. It requires tensor "
+            "cores (FA2 is sm_80+, FA3 is sm_90+), so it is not compiled for "
+            "Pascal targets. Use the Triton attention backend."
+        )
+
+        def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
+            raise RuntimeError(_FA_MISSING)
+
+        def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+            return None
+
+        compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops

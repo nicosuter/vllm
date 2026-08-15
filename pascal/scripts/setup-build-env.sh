@@ -40,7 +40,7 @@ pip install -q --upgrade pip wheel setuptools
 # CUDA runs an sm_X.y cubin on sm_X.z whenever z >= y, so sm_60 code executes on
 # this sm_61 card. Installing torch from any other index silently produces a
 # build that cannot launch a single kernel here.
-pip install -q --index-url https://download.pytorch.org/whl/cu126 torch==2.13.0
+pip install -q --index-url https://download.pytorch.org/whl/cu126 torch==2.13.0 torchvision==0.28.0
 
 echo "==> build dependencies"
 pip install -q "cmake>=3.26.1" ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \

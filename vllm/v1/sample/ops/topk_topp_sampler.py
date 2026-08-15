@@ -48,15 +48,24 @@ def flashinfer_sampler_supported() -> bool:
             "VLLM_USE_FLASHINFER_SAMPLER=0."
         )
         return False
-    from vllm.v1.attention.backends.flashinfer import FlashInferBackend
-
     capability = current_platform.get_device_capability()
     assert capability is not None
     unsupported_reason: str | None = None
-    if not FlashInferBackend.supports_compute_capability(capability):
-        unsupported_reason = (
-            f"unsupported compute capability {capability.as_version_str()}"
-        )
+
+    try:
+        from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+    except ImportError:
+        # flashinfer is a tensor-core library and is deliberately absent from
+        # Pascal installs (see requirements/pascal.txt). Being uninstalled is
+        # just another reason the sampler is unavailable, so route it through
+        # the same fallback path as an unsupported capability rather than
+        # letting the import abort engine startup.
+        unsupported_reason = "flashinfer is not installed"
+    else:
+        if not FlashInferBackend.supports_compute_capability(capability):
+            unsupported_reason = (
+                f"unsupported compute capability {capability.as_version_str()}"
+            )
 
     if unsupported_reason is None:
         logger.info_once("Using FlashInfer for top-p & top-k sampling.", scope="global")
