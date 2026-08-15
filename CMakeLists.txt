@@ -1510,6 +1510,24 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
     include(cmake/external_projects/qutlass.cmake)
     include(cmake/external_projects/tml_fa4.cmake)
 
-    # vllm-flash-attn should be last as it overwrites some CMake functions
-    include(cmake/external_projects/vllm_flash_attn.cmake)
+    # FlashAttention needs tensor cores: FA2 is sm_80+, FA3 is sm_90+. On a
+    # Pascal-only build every one of its ~200 translation units is dead weight
+    # that still costs several minutes to compile, and the resulting kernels
+    # could never launch. vLLM's backend selector already treats a missing
+    # vllm.vllm_flash_attn as an ImportError and falls through to Triton, so
+    # skipping the subproject degrades cleanly instead of breaking startup.
+    set(VLLM_FA_CAPABLE_ARCHS "")
+    foreach(_ARCH ${CUDA_ARCHS})
+      if(_ARCH VERSION_GREATER_EQUAL "8.0")
+        list(APPEND VLLM_FA_CAPABLE_ARCHS "${_ARCH}")
+      endif()
+    endforeach()
+
+    if(VLLM_FA_CAPABLE_ARCHS)
+      # vllm-flash-attn should be last as it overwrites some CMake functions
+      include(cmake/external_projects/vllm_flash_attn.cmake)
+    else()
+      message(STATUS
+        "Skipping vllm-flash-attn: no target arch >= 8.0 in '${CUDA_ARCHS}'")
+    endif()
 endif ()

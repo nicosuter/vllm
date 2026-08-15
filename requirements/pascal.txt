@@ -1,0 +1,39 @@
+# Runtime requirements for the Pascal (SM 6.1) fork.
+#
+# This replaces requirements/cuda.txt, which cannot be used here: it pins torch
+# from the default index (a cu128 build with no Pascal cubins) and pulls a set
+# of accelerator libraries that are either cu13-only or require tensor cores.
+#
+# Install torch separately and first, from the cu126 index — that is the only
+# PyTorch channel still shipping Maxwell/Pascal/Volta cubins:
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu126 \
+#       torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0
+#   pip install -r requirements/pascal.txt
+#
+# torch is deliberately NOT listed below so that resolving this file can never
+# quietly pull a non-Pascal build over the one that was installed on purpose.
+
+-r common.txt
+
+# Required for n-gram speculative decoding.
+numba == 0.65.0
+
+# Faster safetensors loading; pure CPU-side, no arch requirement.
+fastsafetensors >= 0.3.2
+
+# Deliberately omitted from requirements/cuda.txt, with reasons:
+#
+#   flashinfer-python, flashinfer-cubin  tensor-core kernels, SM 7.5+ at best
+#   tilelang                             targets modern arches
+#   nvidia-cutlass-dsl[cu13]             CUDA 13, which dropped sm_61 codegen
+#   humming-kernels[cu13]                same
+#   quack-kernels                        only needed by the CUTLASS DSL above
+#   tokenspeed-mla                       MLA path, unused by our models
+#   apache-tvm-ffi                       only pulled in for the above
+#   nvidia-cudnn-frontend                cuDNN attention needs tensor cores
+#   PyNvVideoCodec, torchcodec           video decode, out of scope until v2
+#   nvtx                                 profiling only
+#
+# vLLM guards each of these behind a capability check or an optional import, so
+# their absence selects the Triton paths rather than breaking startup.
