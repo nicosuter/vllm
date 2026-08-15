@@ -78,16 +78,70 @@ one, so "the GPUs sit at P8" is an artifact of when the sample lands and not
 evidence about anything. And the sm_89 card is a stand-in; if the 3090 Ti pair
 ever shows a materially different ramp, this reopens.
 
-**H2 — Full CUDA graphs are silently disabled.** vLLM picks FlashInfer
-(`Using FLASHINFER ... out of potential backends: ['FLASHINFER', 'TRITON_ATTN']`),
-then discovers FlashInfer only declares `AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE`
-and downgrades `FULL_AND_PIECEWISE` → `PIECEWISE` because spec decode is on
-(`vllm/config/compilation.py`). `TRITON_ATTN` declares `AttentionCGSupport.ALWAYS`
-and was an available candidate. With 64 layers and four forwards per MTP step at
-batch 1, the launch overhead this gives back is not small.
-*Probe:* `probes/cudagraph_modes.py`. *Fix if true:* make backend selection
-prefer a full-graph-capable backend when spec decode is enabled, instead of
-picking one and then quietly degrading the graph mode.
+**H2 — Full CUDA graphs are silently disabled. REPRODUCED, and worse than
+stated: it cannot be worked around from the command line.**
+
+The downgrade reproduces on the proxy model as soon as `kv_cache_dtype=fp8` is
+set, which is what makes FlashInfer the selection in the first place:
+
+```
+Using FLASHINFER attention backend out of potential backends: ['FLASHINFER' ...
+CUDAGraphMode.FULL_AND_PIECEWISE is not supported with spec-decode for
+  attention backend FlashInferBackend (support: UNIFORM_SINGLE_TOKEN_DECODE)
+setting cudagraph_mode=PIECEWISE
+```
+
+The obvious workaround does not work. Forcing `--attention-backend TRITON_ATTN`
+produces **both** of these in one run:
+
+```
+Using AttentionBackendEnum.TRITON_ATTN backend.
+Using FLASHINFER attention backend out of potential backends: ['FLASHINFER' ...
+```
+
+One attention group honours the override; a second one still auto-selects
+FlashInfer. Because `compilation.py` gates on `min_cg_support` — the *minimum*
+across every group — that single escapee drops the whole model to `PIECEWISE`
+anyway. Measured throughput confirms it: 237.3 tok/s (auto), 233.7 (FLASHINFER),
+229.2 (TRITON_ATTN) — three arms that all ran `PIECEWISE`, so what they compare
+is noise, not graph modes.
+
+So the cost of the downgrade is **still unmeasured**, and the fix is not the one
+originally proposed. Making the selector prefer a full-graph-capable backend
+would not have helped, because the group that escapes is not going through the
+override at all.
+
+**The escapee is the MTP drafter, and it is deliberate.** Re-running with
+`--spec-tokens 0` leaves exactly one backend line and no downgrade:
+
+```
+Using AttentionBackendEnum.TRITON_ATTN backend
+```
+
+`vllm/v1/spec_decode/llm_base_proposer.py:1292` says why:
+
+```python
+# Note (matt): Never inherit the attention backend from base, because there are
+# many opportunities for incompatibility, so we always independently autoselect
+# unless explicitly specified in the speculative config.
+base = replace(base, attention_config=replace(
+    base.attention_config, backend=spec_cfg.attention_backend))
+```
+
+The drafter throws away the target's backend by design and auto-selects, which
+on this hardware means FlashInfer. Since `min_cg_support` is a minimum across
+groups, the drafter alone decides the CUDA-graph mode for the whole model.
+
+There is a supported knob — `SpeculativeConfig.attention_backend` — so this may
+be configuration rather than a patch. What makes it fork-worthy either way is
+that the failure is silent and inverted: a one-layer draft head, chosen for
+being cheap, quietly removes full CUDA graphs from all 64 layers of the target,
+and the only trace is a warning naming a backend the user never asked for.
+
+*Also learned:* `llm.llm_engine.vllm_config.compilation_config.cudagraph_mode`
+reported `FULL_AND_PIECEWISE` in the parent while the engine core was running
+`PIECEWISE`. The downgrade happens in the engine-core process and the parent's
+copy never sees it. Parse the log; do not trust the attribute.
 
 **H3 — TP=2 all-reduce over the host bridge.** No P2P, no NVLink, no symmetric
 memory on sm_86, so the custom all-reduce and symm-mem paths are all unavailable
@@ -96,15 +150,43 @@ four forwards per step.
 *Probe:* `probes/allreduce_rate.py`. *Fix if true:* the honest fix is an NVLink
 bridge. Failing that, a 2-GPU staged reduce or a quantized-payload reduce.
 
-**H4 — Prefix caching is defeated by the mamba page size.** The hybrid layout
-forces attention block size to 1600 tokens so the attention page is at least as
-large as the mamba page (`vllm/v1/kv_cache_interface.py`), then pads three
-layers for a further ≤6.25% KV waste. Prefix matches can only land on 1600-token
-boundaries. The production engine has taken 36,364 external prefix-cache
-queries and served zero hits.
-*Fix if true:* decouple attention block size from the mamba page size for hybrid
-models. This is the largest change on the list and the one most likely to be
-worth upstreaming.
+**H4 — Prefix reuse is quantized to the forced block size. CONFIRMED.**
+
+`Platform.check_and_update_config` raises the attention block size until one
+attention block holds a whole mamba state. The 2B proxy lands on 544 tokens; the
+production 27B lands on 1600. Measured reuse on an identical repeat prompt:
+
+```
+resolved block_size: 544
+prefix   cached  cached %  blocks held    waste
+   400        0      0.0%          544      144
+   800      544     68.0%         1088      288
+  1600     1088     68.0%         1632       32
+  2400     2176     90.7%         2720      320
+  3200     2720     85.0%         3264       64
+  4800     4352     90.7%         4896       96
+  6400     5984     93.5%         6528      128
+```
+
+Every `cached` value is an exact multiple of 544, so reuse is strictly
+block-quantized, and the trailing partial block is never cached.
+
+The consequence is not the one to reach for first. Wasted KV is small (32–320
+tokens held and unused). What matters is the top row: **a prompt shorter than
+one block gets zero reuse — not partial, none.** Scaled to the 27B's 1600-token
+block, every request under 1600 tokens can never hit the prefix cache at all,
+and production's mean prompt on that model is 1,173 tokens. The median request
+is structurally excluded.
+
+That also reframes the "36,364 external prefix-cache queries, 0 hits" figure:
+worth re-checking against prompt length before blaming the offload connector.
+
+*Fix:* decouple the attention block size from the mamba page size for hybrid
+models, so the two live in separately-sized pools. This is the largest change on
+the list and the one most likely to be worth upstreaming. Cheap partial
+mitigation to measure first: whether a smaller `mamba_block_size` under
+`mamba_cache_mode=all` buys back granularity without costing GDN kernel
+throughput.
 
 ## Where these were measured
 
