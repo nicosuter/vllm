@@ -1,0 +1,42 @@
+schema: spec-driven
+
+context: |
+  This is a fork of vllm-project/vllm, branched off release tags, carrying
+  performance work for two specific deployments rather than general changes.
+  Upstream contribution rules in AGENTS.md still apply to anything aimed at
+  vllm-project/vllm.
+
+  Targets (both single-stream, batch-1 decode dominated):
+    - PRIMARY   Qwen3.5-27B AWQ-INT4, TP=2, 2x RTX 3090 Ti (sm_86), v0.27.1.
+                Hybrid GDN linear attention + full attention, MTP spec decode.
+    - SECONDARY Gemma4-26B-A4B W4A16 MoE, 1x RTX 4090 (sm_89), nightly 65b7662d3.
+                128 experts top-8, tied unquantized fp16 lm_head.
+
+  Layout: one top-level directory per GPU architecture (`ampere/`, `ada/`), each
+  holding README.md (hypotheses and measured results), k8s/ (dev pod plus a
+  gitignored local overlay), and probes/ (one falsifiable question each). The
+  arch directories deliberately share no code.
+
+  House style, and the rule that matters most here:
+    - Measurement first. Do not write a patch before a probe justifies it.
+    - Record what was ruled out, including probes that produced wrong numbers.
+      The READMEs are prose-heavy on purpose; a hypothesis that died is as
+      valuable as one that lived.
+    - State when a result depends on the quantization, since the checkpoints are
+      mid-iteration and owned by the user.
+    - Mechanism transfers between cards, magnitude does not. A number taken on a
+      proxy model or proxy card is directional only and never justifies a patch.
+
+  Out of scope: runtime flag changes, live deployment config edits, and
+  re-quantizing checkpoints. Config-level wins are reported as findings.
+
+  Python: 88-char lines, Google-style docstrings, `uv` and `.venv/bin/python`
+  only -- never system python3 or bare pip.
+
+rules:
+  proposal:
+    - State the measurement that justifies the change, or say plainly that it is
+      not yet measured.
+    - Include a "What would falsify this" section.
+  tasks:
+    - Every task that produces a number must say which card it was taken on.
