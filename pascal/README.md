@@ -107,4 +107,40 @@ kubectl -n vllm-pascal logs -l job-name=triton-probe -f
 
 ### Results
 
-_Pending first run._
+Run 2026-08-15 on `<node>`, torch `2.13.0+cu126`, triton `3.7.1`:
+
+```
+torch.arch_list           PASS  GTX 1070 Ti sm_61; arch_list has sm_50/60/70/75/80/86/90; usable=['sm_60']
+torch.basic_op            PASS  fp32 matmul max_abs_err=2.136e-04
+torch.fp16_matmul         PASS  fp16 matmul max_rel_err=3.704e-04
+torch.bf16_rejected       PASS  bf16 matmul ran and returned finite values
+torch.fp16_vs_fp32_speed  PASS  fp32=6.32 TF/s  fp16=6.60 TF/s  ratio=1.04
+triton.elementwise        PASS  max_abs_err=0.000e+00
+triton.tl_dot.fp32        PASS  rel_err=0.000e+00
+triton.tl_dot.fp16        PASS  rel_err=0.000e+00
+```
+
+Four conclusions, all of which shrink the project:
+
+1. **Stock cu126 wheels run here.** `sm_60` cubins execute on this `sm_61` card as
+   the CUDA compatibility rule promises. No PyTorch source build.
+
+2. **`tl.dot` works on sm_61, exactly.** Triton selects its FMA lowering below
+   `sm_70` and returns bit-exact results for fp16 and fp32. This is the big one:
+   the 29 Gated DeltaNet kernels in `flash_linear_attention/` do not need to be
+   rewritten in CUDA, and neither do the other ~420 Triton kernels in vLLM.
+   **This is a build-system and backend-selection problem, not a kernel-rewrite
+   problem.**
+
+3. **fp16 is not crippled through torch's GEMM path.** fp16 measures *faster*
+   than fp32 (ratio 1.04), so cuBLAS is already accumulating in fp32 rather than
+   issuing HFMA2. The 1/64 native-fp16 rate is a trap only if we hand-write a
+   kernel that makes fp16 the compute type. fp32 hits 6.32 TF/s, about 78% of
+   this card's 8.1 TFLOPS peak.
+
+4. **bf16 degrades rather than crashes.** It runs, emulated, and returns finite
+   values. So bf16 is a performance bug on this card, not a correctness cliff —
+   worth forcing to fp16, but it will not blow up if one slips through.
+
+Triton needs a C toolchain at runtime to build its driver shim, which is why the
+probe image is `python:3.12` and not `-slim`.
