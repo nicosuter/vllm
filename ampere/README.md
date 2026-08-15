@@ -132,11 +132,44 @@ The drafter throws away the target's backend by design and auto-selects, which
 on this hardware means FlashInfer. Since `min_cg_support` is a minimum across
 groups, the drafter alone decides the CUDA-graph mode for the whole model.
 
-There is a supported knob — `SpeculativeConfig.attention_backend` — so this may
-be configuration rather than a patch. What makes it fork-worthy either way is
-that the failure is silent and inverted: a one-layer draft head, chosen for
-being cheap, quietly removes full CUDA graphs from all 64 layers of the target,
-and the only trace is a warning naming a backend the user never asked for.
+**Neither override alone is enough — the target and the drafter must both be
+set.** Setting only `SpeculativeConfig.attention_backend` leaves the target on
+FlashInfer; setting only `--attention-backend` leaves the drafter on it. Either
+survivor forces `PIECEWISE`. With both set, the downgrade disappears and full
+graphs are captured:
+
+```
+16 Capturing CUDA graphs (decode, FULL)
+10 Capturing CUDA graphs (mixed prefill-decode, PIECEWISE)
+ 1 Using AttentionBackendEnum.TRITON_ATTN backend
+```
+
+| configuration | graph mode | tok/s | ms/token |
+|---|---|---|---|
+| default (both auto) | PIECEWISE | 234.5 | 4.265 |
+| target only | PIECEWISE | 229.2 | 4.363 |
+| drafter only | PIECEWISE | 242.3 | 4.127 |
+| **both TRITON_ATTN** | **FULL** | **333.0** | **3.003** |
+
+**1.42x on single-stream decode**, batch 1, three speculative tokens — from
+configuration, with no engine change. The three PIECEWISE rows agree within
+noise, which is the control: they differ only in which backend ran, and that
+barely matters. What matters is the graph mode.
+
+Measured on sm_89 with the 2B proxy, so the number does not transfer. The
+direction should, and probably understates the 27B: that model has 64 layers to
+this one's 24, and TP=2 adds a second process worth of launch overhead per
+step — both of which are exactly what full graphs remove.
+
+What makes this fork-worthy rather than a config note: the failure is silent,
+inverted, and not fixable by the obvious knob. A one-layer draft head, chosen
+for being cheap, removes full CUDA graphs from all 64 layers of the target; the
+only trace is a warning naming a backend the user never selected; and a user who
+reads that warning and forces the backend it names still gets `PIECEWISE`,
+because the override does not reach both config trees. Candidate change: when
+spec decode is on, make the drafter's independent auto-selection prefer a
+backend whose `AttentionCGSupport` is at least `UNIFORM_BATCH`, and fail loudly
+rather than downgrading when the user has forced one that is not.
 
 *Also learned:* `llm.llm_engine.vllm_config.compilation_config.cudagraph_mode`
 reported `FULL_AND_PIECEWISE` in the parent while the engine core was running
