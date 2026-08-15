@@ -39,7 +39,7 @@
 #define GROUP 32          // K elements sharing one weight scale
 #define BLOCK_M 64
 #define BLOCK_N 64
-#define BLOCK_K 64        // two groups per tile: halves the __syncthreads count
+#define BLOCK_K 128       // four groups per tile: fewer __syncthreads, same registers
 #define GROUPS_PER_TILE (BLOCK_K / GROUP)
 #define THREADS 256
 #define TM 4              // 4x4. 8x4 was tried and lost: 64 accumulators plus
@@ -88,10 +88,10 @@ __global__ void w4a8_dp4a_gemm(const int8_t* __restrict__ A,
     for (int idx = tid * 8; idx < BLOCK_M * BLOCK_K; idx += THREADS * 8) {
       const int r = idx / BLOCK_K, c = idx % BLOCK_K;
       const int gr = block_m + r;
-#pragma unroll
-      for (int j = 0; j < 8; j++) {
-        sA[r][c + j] = (gr < M) ? A[(size_t)gr * K + k0 + c + j] : 0;
-      }
+      uint2 v = make_uint2(0, 0);
+      if (gr < M) v = *reinterpret_cast<const uint2*>(&A[(size_t)gr * K + k0 + c]);
+      *reinterpret_cast<uint32_t*>(&sA[r][c]) = v.x;
+      *reinterpret_cast<uint32_t*>(&sA[r][c + 4]) = v.y;
     }
 
     // Stage B: unpack BLOCK_K x BLOCK_N int4 into int8, subtracting the
@@ -103,10 +103,15 @@ __global__ void w4a8_dp4a_gemm(const int8_t* __restrict__ A,
       const int gn = block_n + c;
       const uint32_t packed =
           (gn < N) ? B[(size_t)(k0 / 8 + kw) * N + gn] : 0x88888888u;
+      uint32_t w0 = 0, w1 = 0;
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        sB[c][kw * 8 + j] = (int8_t)((int)((packed >> (4 * j)) & 0xF) - 8);
+      for (int j = 0; j < 4; j++) {
+        w0 |= (uint32_t)(uint8_t)((int)((packed >> (4 * j)) & 0xF) - 8) << (8 * j);
+        w1 |= (uint32_t)(uint8_t)((int)((packed >> (4 * (j + 4))) & 0xF) - 8)
+              << (8 * j);
       }
+      *reinterpret_cast<uint32_t*>(&sB[c][kw * 8]) = w0;
+      *reinterpret_cast<uint32_t*>(&sB[c][kw * 8 + 4]) = w1;
     }
     __syncthreads();
 
