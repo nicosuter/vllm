@@ -10,8 +10,10 @@
 // is quoted from spec sheets far more often than it is measured. NVIDIA's
 // figure implies about 4x fp32 for GP104. This checks.
 //
-// Both loops are serially dependent through their accumulator, so what is
-// measured is instruction throughput rather than memory or ILP. Results are
+// Each loop keeps CHAINS independent accumulators, because a single dependent
+// chain measures latency rather than throughput and understates this hardware by
+// about 45% (dp4a reads 21.8 TOPS with one chain against 31.7 with eight). A
+// roofline taken that way flatters every kernel compared against it. Results are
 // written out under a branch that never fires, to defeat dead-code elimination.
 //
 //   nvcc -arch=sm_61 -O3 -o dp4a_rate dp4a_rate.cu && ./dp4a_rate
@@ -21,22 +23,41 @@
 
 #define ITERS 100000
 
+// CHAINS independent accumulators per thread. One chain measures *latency*, not
+// throughput: each instruction waits on the previous one's result, so the SM
+// issues at 1/latency however much work is available. A real GEMM keeps many
+// accumulators live precisely to avoid that, so a roofline taken from a single
+// chain understates the hardware and flatters any kernel compared against it.
+#define CHAINS 8
+
 __global__ void dp4a_bench(int* out, int a, int b) {
-  int acc = 0;
-#pragma unroll 16
-  for (int i = 0; i < ITERS; i++) {
-    acc = __dp4a(a, b, acc);
+  int acc[CHAINS];
+#pragma unroll
+  for (int c = 0; c < CHAINS; c++) acc[c] = c;
+#pragma unroll 8
+  for (int i = 0; i < ITERS / CHAINS; i++) {
+#pragma unroll
+    for (int c = 0; c < CHAINS; c++) acc[c] = __dp4a(a, b, acc[c]);
   }
-  if (threadIdx.x == 0xFFFF) *out = acc;
+  int s = 0;
+#pragma unroll
+  for (int c = 0; c < CHAINS; c++) s += acc[c];
+  if (threadIdx.x == 0xFFFF) *out = s;
 }
 
 __global__ void ffma_bench(float* out, float a, float b) {
-  float acc = 0.0f;
-#pragma unroll 16
-  for (int i = 0; i < ITERS; i++) {
-    acc = fmaf(a, b, acc);
+  float acc[CHAINS];
+#pragma unroll
+  for (int c = 0; c < CHAINS; c++) acc[c] = (float)c;
+#pragma unroll 8
+  for (int i = 0; i < ITERS / CHAINS; i++) {
+#pragma unroll
+    for (int c = 0; c < CHAINS; c++) acc[c] = fmaf(a, b, acc[c]);
   }
-  if (threadIdx.x == 0xFFFF) *out = acc;
+  float s = 0.0f;
+#pragma unroll
+  for (int c = 0; c < CHAINS; c++) s += acc[c];
+  if (threadIdx.x == 0xFFFF) *out = s;
 }
 
 // int32 IMAD, for context: it is what a hand-rolled int8 path would fall back
@@ -45,7 +66,7 @@ __global__ void ffma_bench(float* out, float a, float b) {
 __global__ void imad_bench(int* out, int a, int b) {
   int acc = 1;
 #pragma unroll 16
-  for (int i = 0; i < ITERS; i++) {
+  for (int i = 0; i < ITERS; i++) {  // still one chain: IMAD is context, not the roof
     // The accumulator must be an *operand* of the multiply, not just the
     // addend. With `a * b + acc` the product is loop-invariant, nvcc folds it
     // to a constant and strength-reduces the whole loop to a single multiply,
@@ -110,9 +131,9 @@ int main() {
   const double g_f = scalar_ops / (ms_f * 1e6);
   const double g_i = scalar_ops / (ms_i * 1e6);
 
-  printf("  INT8 __dp4a : %8.2f ms  %8.1f GOP/s\n", ms_d, g_d);
-  printf("  fp32 fmaf   : %8.2f ms  %8.1f GFLOP/s\n", ms_f, g_f);
-  printf("  int32 imad  : %8.2f ms  %8.1f GOP/s\n", ms_i, g_i);
+  printf("  INT8 __dp4a : %8.2f ms  %8.1f GOP/s   (%d chains)\n", ms_d, g_d, CHAINS);
+  printf("  fp32 fmaf   : %8.2f ms  %8.1f GFLOP/s (%d chains)\n", ms_f, g_f, CHAINS);
+  printf("  int32 imad  : %8.2f ms  %8.1f GOP/s   (1 chain, latency-bound)\n", ms_i, g_i);
   printf("\n  dp4a / fp32 : %.2fx\n", g_d / g_f);
   printf("  dp4a / imad : %.2fx\n", g_d / g_i);
   printf(
