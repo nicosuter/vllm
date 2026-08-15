@@ -24,7 +24,26 @@ namespace gptq {
 #define BLOCK_KN_SIZE 128
 #define BLOCK_M_SIZE_MAX 8
 #define MAX_GROUPS_IN_BLOCK (BLOCK_KN_SIZE / 32)
-#define MAX_Q_GEMM_ROWS 50
+// Above this many rows, gemm_half_q_half_cuda abandons the fused kernel and
+// reconstructs an fp16 weight matrix for cuBLAS. Upstream's 50 was chosen for
+// hardware where that reconstruct is cheap beside a tensor-core GEMM; here both
+// sides of the comparison moved, and by very different factors (fused kernel
+// ~5.5x from the fp32 rewrite, cuBLAS ~50x from CUBLAS_COMPUTE_32F), so the
+// crossover had to be re-measured. Aggregate decode throughput, tok/s:
+//
+//     batch    50      256
+//        48   700.5   698.5     both fused, unchanged as expected
+//        64   532.3   759.6     +42.7%
+//       128   761.4   844.0     +10.9%
+//
+// At 50 the batch-64 case is *slower* than batch-48: crossing the threshold
+// costs a whole-matrix dequantize per forward pass that does not amortise until
+// far larger batches. Raising it removes that cliff.
+//
+// 256 rather than something larger only because the crossover above 128 was not
+// measured. Prefill is unaffected -- it runs well past any of these values and
+// takes the cuBLAS path either way.
+#define MAX_Q_GEMM_ROWS 256
 #define MAX_Q_GEMM_ROWS_8BIT 24
 #define MAX_ALT_GEMM_ROWS 8
 #define THREADS_X 32

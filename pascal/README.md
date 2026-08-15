@@ -282,14 +282,61 @@ which is 75% of device time and every quantized linear layer -- was built
 entirely out of it. Nothing upstream guards this because no other supported
 architecture is penalised for native fp16.
 
-Two things this is *not*:
+A third instance of the same defect lives in prefill, which shares none of
+that code: above `MAX_Q_GEMM_ROWS` the exllama path reconstructs an fp16 weight
+matrix and calls cuBLAS. It called `cublasHgemm`, which asks for half *compute*,
+and cuBLAS honours that here:
 
-- **Not CUDA graphs.** Measured and rejected: 55.34 / 56.07 / 55.55 ms/step for
-  `none` / `full_decode_only` / `full`, with 35 graphs genuinely captured. Graph
-  capture works on sm_61; launch overhead simply is not the constraint.
-- **Not attention.** Triton attention, Gated DeltaNet and conv1d together are
-  2.8% of device time. The Triton FMA lowering that this fork was expected to
-  live or die by costs almost nothing on the decode path.
+| shape | `cublasHgemm` | `cublasGemmEx` fp32 | |
+|---|---|---|---|
+| prefill512 mlp | 100.50 ms | 1.87 ms | 53.8× |
+| prefill2048 mlp | 383.03 ms | 8.13 ms | 47.1× |
+
+**Not attention.** Triton attention, Gated DeltaNet and conv1d together are 2.8%
+of device time. The Triton FMA lowering that this fork was expected to live or
+die by costs almost nothing on the decode path.
+
+**CUDA graphs: measure them per regime.** At 55 ms/step they were worth nothing
+(55.34 / 56.07 / 55.55 for `none` / `full_decode_only` / `full`, with 35 graphs
+genuinely captured — capture works on sm_61). At 13.7 ms/step the same ~1.3 ms
+of launch overhead is worth **+10.5%** (12.43 ms/step, 80.5 tok/s), and
+`full_decode_only` captures all of it. The conclusion inverted without the
+hardware changing; only the denominator did.
+
+**MTP inverted too.** It was 1.83× against the original baseline and is now a
+regression (68.4 tok/s against 72.8). Speculative decoding amortises per-step
+cost, and there is 4× less of it to amortise while the drafter's overhead is
+unchanged.
+
+### Batching and prefill
+
+Aggregate decode throughput, since a step reads the weights once regardless of
+how many sequences share it — and the KV cache holds 173k tokens, so capacity is
+not the limit:
+
+| batch | ms/step | decode tok/s |
+|---|---|---|
+| 1 | 13.95 | 71.7 |
+| 4 | 18.71 | 213.7 |
+| 16 | 30.00 | 533.4 |
+| 32 | 53.36 | 599.7 |
+| 48 | 68.72 | 698.5 |
+| 64 | 84.26 | 759.6 |
+| 128 | 151.66 | 844.0 |
+
+Measuring this exposed a third fix. At upstream's `MAX_Q_GEMM_ROWS = 50`, batch
+64 ran *slower* than batch 48 (532 against 700): crossing the threshold
+abandons the fused kernel for reconstruct-then-cuBLAS, whose whole-matrix
+dequantize is a fixed per-forward cost that does not amortise until far larger
+batches. That constant was chosen for hardware where the reconstruct is cheap
+beside a tensor-core GEMM, and both sides of the comparison had just moved here
+by very different factors. Raising it to 256 removes the cliff and is worth
+**+42.7%** at batch 64 and **+10.9%** at batch 128.
+
+Prefill, measured separately because it runs the reconstruct path at any prompt
+length worth the name: **1302.9 tok/s** (767.5 µs per prompt token) against a
+~383 µs/token compute roofline. Unlike decode, prefill is compute-bound — which
+is the one place `dp4a` would still have headroom.
 
 Throughput is measured by slope -- two output lengths, differenced -- so prefill
 and setup cancel rather than being smeared into the number. The v1 figure of
