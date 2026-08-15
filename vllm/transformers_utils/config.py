@@ -175,6 +175,32 @@ def _maybe_register_hf_config(config: PretrainedConfig | None) -> None:
         _register_config_class(model_type, _CONFIG_REGISTRY[model_type])
 
 
+def get_maybe_per_layer_attr(config: Any, name: str, default: Any = None) -> Any:
+    """Read a config attribute that transformers may treat as per-layer.
+
+    Models with heterogeneous layers (Gemma4's sliding vs full attention, which
+    use different head dimensions) make recent transformers raise
+    AmbiguousGlobalPerLayerAttributeError on a plain attribute access rather
+    than return a value. getattr's default does not help, because the default
+    only applies to AttributeError, so the exception propagates and the model
+    cannot even be configured.
+
+    The serialized config still carries the declared value. Where that value is
+    per-layer, the maximum is returned, which is what every caller here wants:
+    buffers sized for the largest layer.
+    """
+    try:
+        value = getattr(config, name, default)
+    except Exception:  # noqa: BLE001 - transformers' per-layer guard
+        try:
+            value = config.to_dict().get(name, default)
+        except Exception:  # noqa: BLE001
+            return default
+    if isinstance(value, (list, tuple)):
+        return max(value) if value else default
+    return value
+
+
 def is_rope_parameters_nested(rope_parameters: dict[str, Any]) -> bool:
     """Check if rope_parameters is nested by layer types."""
     # Cannot be nested if rope_parameters is empty

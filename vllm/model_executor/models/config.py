@@ -209,9 +209,15 @@ class Gemma4Config(VerifyAndUpdateConfig):
         uniform kernel path and avoiding the mixed FA3+FA4 penalty.
         When FA4 is not available we fall back to Triton.
         """
+        from vllm.transformers_utils.config import get_maybe_per_layer_attr
+
+        # Gemma4's layers are heterogeneous, so transformers raises on a plain
+        # getattr for head_dim rather than returning it.
         hf_text_config = vllm_config.model_config.hf_text_config
-        head_dim = getattr(hf_text_config, "head_dim", None)
-        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+        head_dim = get_maybe_per_layer_attr(hf_text_config, "head_dim", None)
+        global_head_dim = get_maybe_per_layer_attr(
+            hf_text_config, "global_head_dim", None
+        )
 
         if head_dim is None or global_head_dim is None or head_dim == global_head_dim:
             return

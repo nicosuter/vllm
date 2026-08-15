@@ -36,6 +36,7 @@ def run_vllm(
     mtp_tokens: int = 0,
     text_only: bool = True,
     max_batched_tokens: int = 2048,
+    cpu_offload_gb: float = 0.0,
 ):
     from vllm import LLM, SamplingParams
 
@@ -48,6 +49,13 @@ def run_vllm(
         # profiling far more expensive than the text path it is sizing.
         # v1 is text-only, so decline the modalities outright.
         kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+
+    if cpu_offload_gb:
+        # Gemma 4 E2B does not fit an 8 GB card in any quantization: its
+        # per-layer embeddings are 4.4 GiB and stay unquantized in every
+        # variant, so even the W4A16 QAT release is 7.7 GiB before the KV
+        # cache. Offloading part of the weights to host RAM is the only way in.
+        kwargs["cpu_offload_gb"] = cpu_offload_gb
 
     if mtp_tokens:
         # Qwen3.5 carries a real MTP head (mtp_num_hidden_layers=1), and this
@@ -162,6 +170,12 @@ def main() -> int:
         help="skip the vLLM run and compare a previous run's saved output; "
         "avoids paying Triton's first-run compile again just to redo the "
         "reference",
+    )
+    ap.add_argument(
+        "--cpu-offload-gb",
+        type=float,
+        default=0.0,
+        help="offload this many GiB of weights to host RAM",
     )
     ap.add_argument("--out", default="/work/gate_result.json")
     args = ap.parse_args()

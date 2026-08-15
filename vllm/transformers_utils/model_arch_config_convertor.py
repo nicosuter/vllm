@@ -15,6 +15,7 @@ from vllm.config.utils import getattr_iter
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     ConfigFormat,
+    get_maybe_per_layer_attr,
     get_safetensors_params_metadata,
 )
 from vllm.utils.torch_utils import common_broadcastable_dtype
@@ -605,8 +606,12 @@ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         # Gemma4 uses dual head dimensions: head_dim (sliding attention)
         # and global_head_dim (full attention).  Return the largest so
         # that attention backends allocate buffers large enough for both.
-        head_dim = getattr(self.hf_text_config, "head_dim", 0)
-        global_head_dim = getattr(self.hf_text_config, "global_head_dim", 0)
+        # Gemma4's layers are heterogeneous, so transformers raises on a plain
+        # getattr for head_dim rather than returning it.
+        head_dim = get_maybe_per_layer_attr(self.hf_text_config, "head_dim", 0) or 0
+        global_head_dim = (
+            get_maybe_per_layer_attr(self.hf_text_config, "global_head_dim", 0) or 0
+        )
         return max(head_dim, global_head_dim) or super().get_head_size()
 
 
