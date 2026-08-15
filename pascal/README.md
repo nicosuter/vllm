@@ -216,8 +216,8 @@ decorate functions, so the fix belongs on the platform, once:
 
 ## Status
 
-**v1 green gate: met.** `cyankiwi/Qwen3.5-2B-AWQ-4bit` generates correct text on
-the GTX 1070 Ti.
+**v1 green gate: met, including MTP.** `cyankiwi/Qwen3.5-2B-AWQ-4bit` generates
+correct text on the GTX 1070 Ti, and MTP speculative decoding works.
 
 ```
 >>> 'The capital of Switzerland is'
@@ -233,13 +233,18 @@ the GTX 1070 Ti.
 
 Measured on the card, text-only, `--enforce-eager`, no performance work yet:
 
-| | |
-|---|---|
-| Output throughput | **11.7 tok/s** |
-| Weights on GPU | 1.83 GiB |
-| KV cache | 3.7 GiB / **173,494 tokens** |
-| Attention backend | `TRITON_ATTN` |
-| Compile backend | `eager` |
+| | without MTP | with MTP (`--mtp 1`) |
+|---|---|---|
+| Output throughput | 11.71 tok/s | **21.39 tok/s** (1.83×) |
+| Weights on GPU | 1.83 GiB | 1.88 GiB |
+| KV cache | 3.7 GiB / **173,494 tokens** | |
+| Attention backend | `TRITON_ATTN` | |
+| Compile backend | `eager` | |
+
+MTP needs no second checkpoint: vLLM resolves the architecture to `Qwen3_5MTP`
+and builds the drafter from the same weights, which is why this checkpoint
+mattered — it is the one that kept `mtp.*` quantized instead of stripping it.
+The extra ~50 MiB is the MTP head.
 
 The KV cache figure is worth noting: there was never any need for the
 short-context compromise that an 8 GB card seems to imply. At 2.4 GB of INT4
