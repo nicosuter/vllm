@@ -61,12 +61,40 @@ __forceinline__ __device__ half2 dot22_8(half2 (&dq)[4], const half* a_ptr,
   return __hadd2(result, g_result);
 }
 
+// GP102/104/106/107 (sm_61) and GP10B (sm_62) carry a single FP16x2 unit per
+// SM, so __hfma2 runs at 1/64 of the fp32 rate. GP100 (sm_60) is the exception
+// in the family and has genuine 2x fp16 throughput, so it must keep the half2
+// path. Measured by pascal/probes/fp16_rate.cu rather than assumed.
+//
+// This function is the whole arithmetic core of the 4-bit exllama GEMM -- the
+// only kernel selected for quantized linear layers on this hardware -- so on
+// sm_61 it is where decode spends its time. Converting to fp32 costs two cvt
+// instructions per half2 and runs the multiply-add at full rate. It also
+// accumulates in fp32 instead of fp16, so the result is strictly more accurate
+// than upstream's.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 610 || __CUDA_ARCH__ == 620)
+  #define VLLM_GPTQ_SLOW_NATIVE_FP16 1
+#endif
+
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
+#ifdef VLLM_GPTQ_SLOW_NATIVE_FP16
+  float result = 0.0f;
+  const half2* a2_ptr = (const half2*)a_ptr;
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float2 d = __half22float2(dq[i]);
+    const float2 a = __half22float2(*a2_ptr++);
+    result = fmaf(d.x, a.x, result);
+    result = fmaf(d.y, a.y, result);
+  }
+  return result;
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
-#pragma unroll
+  #pragma unroll
   for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
   return __half2float(__low2half(result)) + __half2float(__high2half(result));
+#endif
 }
 
 __forceinline__ __device__ half2 dot22_8(half2 (&dq)[4], const half* a_ptr,
