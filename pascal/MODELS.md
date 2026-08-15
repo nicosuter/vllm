@@ -14,6 +14,8 @@ unquantized, because 8 GB does not hold fp16 weights plus a KV cache.
 | `Qwen/Qwen3-VL-Embedding-2B` | as requested, fp16 | 4.3 GB | **Works.** dim 2048, related pair leads by 0.52 cosine |
 | `Qwen/Qwen3-VL-Reranker-2B` | as requested, fp16 | 4.3 GB | **Works** via yes/no logits; vLLM's score() path cannot load it |
 | `google/gemma-4-E2B-it-qat-q4_0-unquantized` | `google/gemma-4-E2B-it-qat-w4a16-ct` | 8.3 GB | **Does not fit.** Three blockers cleared, OOM remains; see below |
+| `RedHatAI/Qwen2.5-1.5B-Instruct-FP8-dynamic` | as requested | 2.2 GB | **Works.** 57.5 tok/s batch 1; first FP8 checkpoint on this card. 2.98 GiB resident — see the FP8 section in the main README |
+| `Qwen/Qwen3-0.6B-FP8` | as requested | 0.7 GB | **Does not load.** Block-wise `[128,128]` fp8; no block-scaled kernel exists below capability 8.9. Declines cleanly. Use a per-channel `-FP8-dynamic` checkpoint instead |
 
 ### Gemma 4 E2B does not fit this card, and the reason is structural
 

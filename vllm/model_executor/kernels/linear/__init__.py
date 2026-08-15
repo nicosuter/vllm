@@ -186,6 +186,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.humming import (
 from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
     MarlinFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.pascal import (
+    PascalFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     ChannelWiseTorchFP8ScaledMMLinearKernel,
     PerTensorTorchFP8ScaledMMLinearKernel,
@@ -346,6 +349,9 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         PerTensorTorchFP8ScaledMMLinearKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
         HummingFP8ScaledMMLinearKernel,
+        # Last: it only claims capabilities below 7.5, where none of the above
+        # can run at all.
+        PascalFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
         AiterHipbMMPerTokenFp8ScaledMMLinearKernel,
@@ -396,6 +402,9 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
     PlatformEnum.CUDA: [
         HummingFP8ScaledMMLinearKernel,
         MarlinFP8ScaledMMLinearKernel,
+        # Last: it only claims capabilities below 7.5, where the two above
+        # cannot run at all.
+        PascalFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
         # To be added
@@ -1153,6 +1162,7 @@ __all__ = [
     "AiterInt8ScaledMMLinearKernel",
     "CPUInt8ScaledMMLinearKernel",
     "CutlassFP8ScaledMMLinearKernel",
+    "PascalFP8ScaledMMLinearKernel",
     "CutlassInt8ScaledMMLinearKernel",
     "FlashInferFP8ScaledMMLinearKernel",
     "ChannelWiseTorchFP8ScaledMMLinearKernel",

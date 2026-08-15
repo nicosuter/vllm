@@ -51,8 +51,12 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # turing and up
-        return 75
+        # Was 75, "turing and up", which described Marlin rather than the
+        # scheme. W8A16 is the one fp8 shape that never needed FP8 hardware --
+        # the weight is decoded, not multiplied in fp8 -- so it reaches down to
+        # Pascal via PascalFP8ScaledMMLinearKernel. Kernel choice stays guarded
+        # per candidate.
+        return 60
 
     def create_weights(
         self,

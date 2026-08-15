@@ -21,6 +21,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
 from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
     MarlinFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.pascal import (
+    PascalFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     ChannelWiseTorchFP8ScaledMMLinearKernel,
     PerTensorTorchFP8ScaledMMLinearKernel,
@@ -59,6 +62,7 @@ __all__ = [
     "CutlassInt8ScaledMMLinearKernel",
     "FlashInferFP8ScaledMMLinearKernel",
     "MarlinFP8ScaledMMLinearKernel",
+    "PascalFP8ScaledMMLinearKernel",
     "ChannelWiseTorchFP8ScaledMMLinearKernel",
     "PerTensorTorchFP8ScaledMMLinearKernel",
     "RowWiseTorchFP8ScaledMMLinearKernel",

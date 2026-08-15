@@ -142,7 +142,16 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        # As with wNa16, 75 was the floor of the best kernel of its day rather
+        # than of the format. e4m3 is a storage encoding, and decoding it needs
+        # no FP8 hardware -- PascalFP8ScaledMMLinearKernel claims capabilities
+        # below 7.5 and nothing else does.
+        #
+        # Every faster candidate keeps its own guard, so this does not let
+        # CUTLASS (89), FlashInfer or Marlin (75) onto a card that cannot host
+        # them; it only stops the method being rejected before the choice is
+        # made.
+        return 60
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:

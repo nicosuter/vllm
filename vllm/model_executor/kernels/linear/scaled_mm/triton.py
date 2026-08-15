@@ -161,6 +161,15 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     def is_supported(cls, compute_capability=None):
         if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
             return False, "only CUDA-alike and XPU devices are supported."
+        if current_platform.is_cuda():
+            if compute_capability is None:
+                compute_capability = current_platform.get_device_capability().to_int()
+            # Triton has no e4m3 below Turing -- it offers fp8e4b15 and fp8e5
+            # instead -- so this reports itself unsupported rather than raising
+            # "type fp8e4nv not supported in this architecture" from inside the
+            # JIT, several layers below anything the user can act on.
+            if compute_capability < 75:
+                return False, "Triton has no fp8e4nv below compute capability 7.5."
         return True, None
 
     def apply_block_scaled_mm(

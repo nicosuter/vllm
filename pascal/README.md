@@ -52,7 +52,7 @@ These constraints drive nearly every decision in this fork:
 
 | Constraint | Consequence |
 |---|---|
-| No tensor cores | FlashAttention, FlashInfer, Marlin, Machete, CUTLASS SM80+ and all FP8 paths are unavailable and get compiled out |
+| No tensor cores | FlashAttention, FlashInfer, Marlin, Machete, CUTLASS SM80+ and every FP8 *GEMM* are unavailable and get compiled out. FP8 *checkpoints* still load — see below |
 | No bfloat16 | Everything is fp16 storage with fp32 compute |
 | fp16 arithmetic at 1/64 rate (HFMA2 on GP104) | fp16 is a *storage* format only; it must never become the compute type |
 | INT8 `dp4a`/`dp2a` **is** available | The fast path worth reaching for in v2 |
@@ -210,6 +210,111 @@ unconditionally, and `gdn_attn` handles the 18 Gated DeltaNet layers.
 Attention resolves the same way: `TritonAttentionBackend.supports_compute_capability`
 returns `True` unconditionally, and `gdn_attn` handles the 18 Gated DeltaNet
 layers.
+
+### FP8 checkpoints load, because e4m3 is a storage format
+
+"No FP8 hardware" rules out an FP8 *multiply*, which this fork was never going
+to use — there are no tensor cores to issue one from. It says nothing about
+reading the bytes. e4m3 is 1 sign, 4 exponent (bias 7), 3 mantissa; dropping
+those fields into the fp32 positions gives the right number with the wrong
+exponent bias, off by a constant `2^120` for every input. One multiply corrects
+all of them.
+
+`pascal/probes/fp8_decode.cu` checks that on the card and measures what it costs:
+
+```
+decode vs definition: 254/254 finite patterns exact (14 subnormal), 0 wrong
+  fp8  decode    2.412 ms    222.6 GB/s   222.61 Gweight/s
+  fp16 convert   4.806 ms    223.4 GB/s   111.71 Gweight/s
+  fp8 delivers 1.99x the weights/s at 100% of fp16's bandwidth
+```
+
+Two results worth keeping. `cuda_fp8.h` does compile and run correctly on
+sm_61 — NVIDIA ships a software path — but it is 1.10x slower in the inner loop
+(2.645 ms, 203 GB/s) than moving the fields by hand. And **`-ftz=true` or
+`--use_fast_math` silently zeroes all 14 subnormal patterns**: the decode routes
+a subnormal through fp32, and a flush-to-zero build discards it without
+complaining. That is a miscompile that produces plausible weights.
+
+What is actually wired up is `PascalFP8ScaledMMLinearKernel`, last in the
+candidate list behind Humming and Marlin, claiming only capabilities below 7.5.
+It decodes once at load and hands fp16 to cuBLAS, which this fork already runs
+with `CUBLAS_COMPUTE_32F`. Two capability floors moved from 75 to 60 to let the
+choice happen at all — the same argument as `wNa16` above: 75 described the best
+kernel of its day, not the format.
+
+Which FP8 actually runs, then. Per-tensor and per-channel scales do;
+**block-wise `[128, 128]` does not**, and that covers Qwen's own `-FP8`
+releases, whose `quantization_config` carries `weight_block_size`. Block quant
+routes to a separate candidate list this kernel is not in, and none of its
+members can run here. That used to surface as a Triton JIT error four layers
+down — `type fp8e4nv not supported in this architecture` — because
+`TritonFp8BlockScaledMMKernel` claimed every CUDA device without checking. It
+now declines below 7.5, so the failure reads as intended:
+
+```
+ValueError: Failed to find a kernel that can implement the ScaledMM linear layer. Reasons:
+  CutlassFp8BlockScaledMMKernel The device compute capability of 61 is not supported..
+  TritonFp8BlockScaledMMKernel Triton has no fp8e4nv below compute capability 7.5..
+```
+
+Prefer the `-FP8-dynamic` checkpoints (RedHatAI and the rest of the
+compressed-tensors family), which are per-channel.
+
+Lowering the `fp8` floor has one consequence worth naming: `Fp8Config` also
+covers MoE, and the capability check in `vllm/config/vllm.py` is a single gate
+for the whole method. An FP8 **MoE** checkpoint now gets past it and fails
+further in, at `select_fp8_moe_backend`'s `NotImplementedError`, instead of at
+the clean "not supported for the current GPU". Both are loud; only the message
+got worse. Linear is what was made to work.
+
+Because vLLM already routes W8A8 FP8 to `CompressedTensorsW8A16Fp8` below
+capability 8.9, an ordinary `FP8-dynamic` checkpoint lands there without
+knowing anything about this card. All 112 linear layers of
+`Qwen2.5-1.5B-Instruct-FP8-dynamic` resolve to it, and the activation scale is
+dropped rather than honoured — quantizing activations only pays against an fp8
+MMA, and there is none to aim at.
+
+**The byte saving is not banked yet.** Decoding at load means a 2.09 GiB fp8
+checkpoint occupies 2.98 GiB resident, the footprint of the fp16 model, and
+decode runs at **57.5 tok/s at batch 1** (17.39 ms/step) against the gate
+model's 80.5 tok/s on int4 — the gap is weight bytes, which is the whole story
+at batch 1. Keeping the byte narrow needs a fused decode-GEMM; the probe above
+exists to show that is worth building, and it is not built.
+
+#### The gate metric does not survive this model, and neither does fp16
+
+`gate_check.py` reports **FAIL, worst prefix agreement 0%** here. That is not a
+kernel fault. Run the identical comparison with *transformers' own fp16* on this
+card instead of vLLM and it fails the same way:
+
+| | worst prefix agreement | verdict |
+|---|---|---|
+| vLLM + `PascalFP8ScaledMMLinearKernel` | 0% | FAIL |
+| HF transformers fp16, same card, same weights | 25% | FAIL |
+
+Both diverge in the same place — the ordering of two distractors in a multiple
+choice list, a genuine coin flip. Greedy prefix agreement measures fp16 against
+fp32 on a model full of near-ties, and 32 tokens of it compounds a per-token
+disagreement into a sequence one.
+
+Per-token logits are the measurement that survives, over 102 positions:
+
+| | top-1 agreement with CPU fp32 | mean abs logprob difference |
+|---|---|---|
+| HF fp16 on this card | 96.1% | 0.0735 |
+| **vLLM + `PascalFP8ScaledMMLinearKernel`** | **95.1%** | **0.0408** |
+
+The kernel tracks the fp32 reference at least as closely as ordinary fp16
+inference does, and its logprobs are closer to it, because vLLM keeps more of
+the surrounding arithmetic in fp32. Separately, the dequantized weight was
+compared against the checkpoint directly and is bit-identical in fp32; the only
+loss is the fp16 store, at 5.8e-5 mean relative error.
+
+Worth recording because it nearly went the other way: an earlier run of this
+comparison read `prompt_logprobs=0`, which returns the *actual* token's logprob
+rather than the argmax. Comparing that against the reference's argmax scored
+46% and looked exactly like a broken kernel.
 
 ### The runtime changes, and the one that was not obvious
 
