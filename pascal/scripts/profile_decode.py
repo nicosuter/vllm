@@ -28,13 +28,21 @@ import sys
 PROMPT = "Explain how a CPU scheduler decides which thread to run next."
 
 
-def run_profile(model: str, out_dir: str, max_tokens: int) -> None:
+def run_profile(model: str, out_dir: str, max_tokens: int,
+                dtype: str = "auto") -> None:
     from vllm import LLM, SamplingParams
     from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
 
     llm = LLM(
         model=model,
-        dtype="float16",
+        # "auto", not "float16". On Pascal supported_dtypes is
+        # [float16, float32], so auto still picks fp16 for ordinary models --
+        # but vLLM refuses fp16 outright for the families in
+        # _FLOAT16_NOT_SUPPORTED_MODELS (gemma2, gemma3, gemma3_text, glm4,
+        # "numerical instability"), and for those auto falls back to fp32 while
+        # a hardcoded "float16" raises ValueError instead. bf16 is never
+        # selectable here, which is the whole point.
+        dtype=dtype,
         enforce_eager=False,
         gpu_memory_utilization=0.85,
         max_model_len=2048,
@@ -124,6 +132,7 @@ def main() -> int:
     ap.add_argument("--out-dir", default="/work/profile")
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--dtype", default="auto")
     ap.add_argument(
         "--summarize-only",
         action="store_true",
@@ -133,7 +142,7 @@ def main() -> int:
 
     os.makedirs(args.out_dir, exist_ok=True)
     if not args.summarize_only:
-        run_profile(args.model, args.out_dir, args.max_tokens)
+        run_profile(args.model, args.out_dir, args.max_tokens, args.dtype)
     return summarize(args.out_dir, args.top)
 
 

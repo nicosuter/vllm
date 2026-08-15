@@ -44,7 +44,8 @@ PROMPT = (
 )
 
 
-def build_llm(model: str, graphs: str, mtp: int, gpu_frac: float):
+def build_llm(model: str, graphs: str, mtp: int, gpu_frac: float,
+              dtype: str = "auto"):
     from vllm import LLM
     from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
 
@@ -68,7 +69,14 @@ def build_llm(model: str, graphs: str, mtp: int, gpu_frac: float):
 
     return LLM(
         model=model,
-        dtype="float16",
+        # "auto", not "float16". On Pascal supported_dtypes is
+        # [float16, float32], so auto still picks fp16 for ordinary models --
+        # but vLLM refuses fp16 outright for the families in
+        # _FLOAT16_NOT_SUPPORTED_MODELS (gemma2, gemma3, gemma3_text, glm4,
+        # "numerical instability"), and for those auto falls back to fp32 while
+        # a hardcoded "float16" raises ValueError instead. bf16 is never
+        # selectable here, which is the whole point.
+        dtype=dtype,
         # Not enforce_eager: that would force cudagraph_mode=NONE and overwrite
         # the setting this benchmark exists to vary.
         enforce_eager=False,
@@ -190,6 +198,7 @@ def main() -> int:
     )
     ap.add_argument("--mtp", type=int, default=0)
     ap.add_argument("--gpu-frac", type=float, default=0.85)
+    ap.add_argument("--dtype", default="auto")
     ap.add_argument("--short", type=int, default=16)
     ap.add_argument("--long", type=int, default=144)
     ap.add_argument("--reps", type=int, default=3)
@@ -215,7 +224,7 @@ def main() -> int:
         print(f"\n{'=' * 72}\ncudagraph_mode={graphs}  mtp={args.mtp}\n{'=' * 72}",
               flush=True)
         try:
-            llm = build_llm(args.model, graphs, args.mtp, args.gpu_frac)
+            llm = build_llm(args.model, graphs, args.mtp, args.gpu_frac, args.dtype)
             # One engine serves every batch size, since only the request shape
             # differs; rebuilding per batch would pay engine init each time.
             if len(args.batch) == 1:

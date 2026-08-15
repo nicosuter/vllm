@@ -37,6 +37,7 @@ def run_vllm(
     text_only: bool = True,
     max_batched_tokens: int = 2048,
     cpu_offload_gb: float = 0.0,
+    dtype: str = "auto",
 ):
     from vllm import LLM, SamplingParams
 
@@ -74,7 +75,14 @@ def run_vllm(
 
     llm = LLM(
         model=model,
-        dtype="float16",  # Pascal has no usable bf16
+        # "auto", not "float16". On Pascal supported_dtypes is
+        # [float16, float32], so auto still picks fp16 for ordinary models --
+        # but vLLM refuses fp16 outright for the families in
+        # _FLOAT16_NOT_SUPPORTED_MODELS (gemma2, gemma3, gemma3_text, glm4,
+        # "numerical instability"), and for those auto falls back to fp32 while
+        # a hardcoded "float16" raises ValueError instead. bf16 is never
+        # selectable here, which is the whole point.
+        dtype=dtype,
         enforce_eager=enforce_eager,
         gpu_memory_utilization=gpu_frac,
         max_model_len=2048,
@@ -147,6 +155,7 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--gpu-frac", type=float, default=0.85)
+    ap.add_argument("--dtype", default="auto")
     ap.add_argument(
         "--max-batched-tokens",
         type=int,
@@ -198,6 +207,7 @@ def main() -> int:
             args.gpu_frac,
             args.mtp,
             not args.multimodal,
+            dtype=args.dtype,
         )
 
     print("\n" + "=" * 72)

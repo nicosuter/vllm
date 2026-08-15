@@ -10,7 +10,7 @@ kind: Kustomization
 # namespaces describe one particular cluster, not the fork.
 
 resources:
-  - ../
+  - ../base
 
 # Namespace everything lands in. Create it first: kubectl create ns <name>
 namespace: vllm-pascal
