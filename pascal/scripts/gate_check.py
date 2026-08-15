@@ -48,7 +48,13 @@ def run_vllm(
         # apply_rotary_emb needs the FA extension), which makes startup
         # profiling far more expensive than the text path it is sizing.
         # v1 is text-only, so decline the modalities outright.
-        kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+        # Gemma 4 is any-to-any: audio counts too. Leaving audio enabled builds
+        # and profiles the audio tower, whose weights sit in the quantization
+        # ignore list and so stay at the checkpoint's bfloat16 — which then
+        # meets fp16 weights and fails with "expected mat1 and mat2 to have the
+        # same dtype". Only Pascal hits this, because only Pascal is forced to
+        # convert the model to fp16 in the first place.
+        kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
 
     if cpu_offload_gb:
         # Gemma 4 E2B does not fit an 8 GB card in any quantization: its

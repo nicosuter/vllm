@@ -227,8 +227,51 @@ the Triton kernel already verified on sm_61.
 | `ibm-granite/granite-4.1-3b` | `cyankiwi/granite-4.1-3b-AWQ-INT4` | 2.3 GB | **Works.** 16.8 tok/s |
 | `Qwen/Qwen3-VL-Embedding-2B` | as requested, fp16 | 4.3 GB | **Works.** dim 2048, related pair leads by 0.52 cosine |
 | `Qwen/Qwen3-VL-Reranker-2B` | as requested, fp16 | 4.3 GB | **Works** via yes/no logits; vLLM's score() path cannot load it |
-| `google/gemma-4-E2B-it-qat-q4_0-unquantized` | `google/gemma-4-E2B-it-qat-w4a16-ct` | 8.3 GB | needs `cpu_offload_gb`; see below |
+| `google/gemma-4-E2B-it-qat-q4_0-unquantized` | `google/gemma-4-E2B-it-qat-w4a16-ct` | 8.3 GB | **Does not fit.** Three blockers cleared, OOM remains; see below |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | — | 3.9 GB | **Not supported by vLLM** (arch absent upstream too) |
+
+### Gemma 4 E2B does not fit this card, and the reason is structural
+
+Three separate blockers were found and cleared, and the fourth is the one that
+stops it. Recorded in order, because each had to be removed to see the next.
+
+**1. It does not fit in any quantization.** `embed_tokens_per_layer` is 4.375
+GiB and stays unquantized in every variant, so Google's W4A16 QAT release is
+still 7.745 GiB:
+
+```
+  4.375 GiB  model.language_model.embed_tokens_per_layer   <- unquantized
+  0.977 GiB  model.language_model.layers                   <- INT4
+  0.750 GiB  lm_head.weight
+  0.750 GiB  model.language_model.embed_tokens
+  0.568 GiB  model.audio_tower
+  0.312 GiB  model.vision_tower
+```
+
+**2. transformers incompatibility.** Cleared by pinning 5.8.1 plus two code
+fixes — see `get_maybe_per_layer_attr`. Not a Pascal problem.
+
+**3. A bf16 activation meeting an fp16 weight.** Gemma 4 is any-to-any, so
+declining only image and video still builds and profiles the **audio** tower,
+whose weights are in the quantization ignore list and therefore keep the
+checkpoint's bfloat16. They then meet fp16 weights:
+`expected mat1 and mat2 to have the same dtype, but got: c10::BFloat16 != c10::Half`.
+Declining audio as well fixes it and drops the load from 6.96 to 6.39 GiB.
+
+This one *is* Pascal-shaped: only Pascal is forced to convert the model to fp16,
+so only Pascal exercises the path where a bf16 island survives.
+
+**4. Out of memory, and `cpu_offload_gb` does not help.** 6.39 GiB of weights
+plus KV cache and activations exceeds 7.92 GiB. The load reports **6.39 GiB with
+and without** `--cpu-offload-gb 3.0`, so the offload is not reducing this
+model's resident footprint — its weights evidently do not go through the path
+that offload wraps.
+
+Making Gemma 4 E2B work here means offloading the per-layer embeddings
+specifically, which is what Gemma-3n's design intends: they are a per-token
+gather, cheap to keep in host RAM and cheap to transfer. That is real
+engineering, not a flag, and it is the honest next step rather than something
+this fork currently does.
 
 ### The reranker works, but not through vLLM's scoring API
 
