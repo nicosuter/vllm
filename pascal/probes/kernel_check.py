@@ -67,12 +67,82 @@ print("=" * 72, flush=True)
 print(f"device {torch.cuda.get_device_name()} sm_{''.join(map(str, torch.cuda.get_device_capability()))}", flush=True)
 
 
+@check("w4a16.exllama_vs_fp32_dequant")
+def _w4a16_exllama():
+    """Pack a known weight to int4, run the exllama kernel, compare to fp32 math.
+
+    This is the kernel the gate model's every linear layer actually goes
+    through -- the engine logs "Using ExllamaLinearKernel for
+    CompressedTensorsWNA16" -- and it is reachable here because it declares
+    get_min_capability() == 60 while Marlin (sm_75+), Machete (sm_90) and
+    CUTLASS W4A8 (sm_90) all opt out.
+
+    It is also the kernel this fork modified: dot22_8_f now accumulates in fp32
+    on sm_61 rather than in half2, so this check is what stands behind the claim
+    that the rewrite did not change the mathematics. The HF fp32 reference that
+    would otherwise verify it is unavailable for the reason given at the top of
+    this file, which makes this check load-bearing rather than incidental.
+    """
+    try:
+        from vllm import _custom_ops as ops
+    except ImportError as exc:
+        raise Skip(f"_custom_ops not importable ({exc})") from exc
+    if not hasattr(ops, "gptq_gemm"):
+        raise Skip("gptq_gemm absent from this build")
+
+    torch.manual_seed(0)
+    # The checkpoint's own quantization_config: symmetric int4, group_size 32.
+    M, K, N, group = 8, 2048, 512, 32
+    n_groups = K // group
+
+    qweight = torch.randint(0, 16, (K, N), device="cuda", dtype=torch.int32)
+    scales = torch.rand(n_groups, N, device="cuda", dtype=torch.float16) * 0.02 + 0.01
+    x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+
+    # uint4b8 is symmetric with an implicit zero point of 8. vLLM stores 7,
+    # because the exllama kernel adds 1 back at inference -- a quirk of the
+    # original GPTQ checkpoint format that process_weights_after_loading
+    # reproduces deliberately.
+    g_idx_ref = torch.arange(K, device="cuda") // group
+    w_deq = (qweight.float() - 8.0) * scales[g_idx_ref].float()
+    ref = x.float() @ w_deq
+
+    # GPTQ packs along K (rows), unlike the Triton kernel below which packs
+    # along N: w_q is [K//8, N], eight 4-bit values per int32, low nibble first.
+    packed = torch.zeros((K // 8, N), device="cuda", dtype=torch.int32)
+    for i in range(8):
+        packed |= (qweight[i::8, :] & 0xF) << (4 * i)
+
+    zeros = torch.full((n_groups, N), 7, device="cuda", dtype=torch.int32)
+    packed_zeros = torch.zeros((n_groups, N // 8), device="cuda", dtype=torch.int32)
+    for i in range(8):
+        packed_zeros |= (zeros[:, i::8] & 0xF) << (4 * i)
+
+    # Without act-order the real path passes an empty g_idx, and still runs
+    # gptq_shuffle, which rearranges the packed weights into the layout the
+    # kernel reads. Skipping it would compare against a different memory order.
+    empty_g_idx = torch.empty((0,), dtype=torch.int, device="cuda")
+    packed = packed.contiguous()
+    ops.gptq_shuffle(packed, empty_g_idx, 4)
+
+    got = ops.gptq_gemm(x, packed, packed_zeros, scales, empty_g_idx, True, False, 4)
+    err = rel_err(got, ref)
+    if err > 5e-2:
+        raise RuntimeError(
+            f"exllama W4A16 disagrees with fp32 dequant reference: rel_err={err:.3e}"
+        )
+    return f"rel_err={err:.3e} (M={M} K={K} N={N} group={group})"
+
+
 @check("w4a16.triton_vs_fp32_dequant")
 def _w4a16():
     """Pack a known weight to int4, run the Triton kernel, compare to fp32 math.
 
-    This is the kernel the gate model's every linear layer goes through, and the
-    one Pascal reaches only because Marlin (sm_75+) and Machete (sm_90) opt out.
+    Not the path this fork takes -- the kernel above is -- but kept because the
+    Triton kernel is what a capability-only reading of the selection logic
+    predicts, and because its docstring calls it a ROCm MI300 kernel. Verifying
+    it costs nothing and documents that the choice between the two is a
+    selection decision rather than a correctness one.
     """
     try:
         from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
