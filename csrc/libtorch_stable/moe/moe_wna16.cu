@@ -28,11 +28,26 @@ __global__ void moe_wna16_gemm_kernel(
     uint32_t size_n, uint32_t size_k, uint16_t BLOCK_SIZE_M,
     uint16_t BLOCK_SIZE_N, uint16_t BLOCK_SIZE_K, bool has_zp,
     bool mul_topk_weight) {
+// The accumulation at the end of this kernel is an atomicAdd on scalar_t.
+// atomicAdd(__nv_bfloat16*) needs sm_80, which is why upstream compiles the
+// bf16 instantiation out below that. atomicAdd(__half*) needs sm_70, so on
+// Pascal the fp16 instantiation has to go the same way.
+//
+// This leaves MoE W4A16 unavailable on sm_61 rather than wrong: no vLLM model
+// we target is MoE (the gate model is dense), and no MoE checkpoint worth
+// running fits in this card's 8 GB anyway. If an MoE family is ever added to
+// this fork, the fix is a CAS-based half atomicAdd, not this guard.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
   if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
     return;
-  } else {
+  } else
 #endif
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 700
+      if constexpr (std::is_same<scalar_t, half>::value) {
+    return;
+  } else
+#endif
+  {
 
     using Dtype = ScalarType<scalar_t>;
     using scalar_t2 = typename ScalarType<scalar_t>::scalar_t2;
@@ -219,10 +234,7 @@ __global__ void moe_wna16_gemm_kernel(
       atomicAdd(&output[token_index * size_n + offset_n],
                 Dtype::float2num(res[m]));
     }
-
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
   }
-#endif
 }
 
 template <typename scalar_t>
