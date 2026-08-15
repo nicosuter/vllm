@@ -37,14 +37,35 @@
 #include <vector>
 
 #define GROUP 32          // K elements sharing one weight scale
-#define BLOCK_M 64
-#define BLOCK_N 64
-#define BLOCK_K 128       // four groups per tile: fewer __syncthreads, same registers
+
+// Tunable via -D so configurations can be swept without editing the source.
+// Defaults are the best found by pascal/probes/dp4a_sweep.sh.
+#ifndef BLOCK_M
+  #define BLOCK_M 64
+#endif
+#ifndef BLOCK_N
+  #define BLOCK_N 64
+#endif
+#ifndef BLOCK_K
+  #define BLOCK_K 128
+#endif
+#ifndef THREADS
+  #define THREADS 256
+#endif
+#ifndef TM
+  #define TM 4
+#endif
+#ifndef TN
+  #define TN 4
+#endif
+
 #define GROUPS_PER_TILE (BLOCK_K / GROUP)
-#define THREADS 256
-#define TM 4              // 4x4. 8x4 was tried and lost: 64 accumulators plus
-#define TN 4              // addressing spills occupancy, and BLOCK_M=128 wastes
-                          // half the tile at batch 64.
+
+static_assert(BLOCK_M % TM == 0, "BLOCK_M must divide by TM");
+static_assert(BLOCK_N % TN == 0, "BLOCK_N must divide by TN");
+static_assert((BLOCK_M / TM) * (BLOCK_N / TN) == THREADS,
+              "thread count must exactly cover the block tile");
+static_assert(BLOCK_K % GROUP == 0, "BLOCK_K must be a multiple of GROUP");
 
 #define CHECK(x)                                                          \
   do {                                                                    \
@@ -58,11 +79,21 @@
 // A: [M, K] int8 row-major.  a_scale: [M] fp32.
 // B: [K/8, N] int32, eight 4-bit values along K per word, low nibble first.
 // w_scale: [K/GROUP, N] fp16.  C: [M, N] fp16.
-__global__ void w4a8_dp4a_gemm(const int8_t* __restrict__ A,
-                               const uint32_t* __restrict__ B,
-                               const half* __restrict__ w_scale,
-                               const float* __restrict__ a_scale,
-                               half* __restrict__ C, int M, int N, int K) {
+// __launch_bounds__ is the single most valuable line in this kernel. Left to
+// itself nvcc allocates 126 registers, which fits only 2 blocks per SM (25%
+// occupancy) and costs 1.81x -> 1.41x. Asking for 3 resident blocks caps it
+// near 80 registers; the ~52 bytes of spill that causes are far cheaper than
+// the occupancy they buy. Pushing further to 64 registers is not: spill jumps
+// to 276 bytes and throughput halves.
+//
+// This was the last thing found and the largest single win, which is worth
+// recording -- an entire earlier tile sweep was invalidated by it, because
+// uncapped register allocation varies per configuration and was silently the
+// dominant variable rather than the tile shape being measured.
+__global__ __launch_bounds__(THREADS, 3) void w4a8_dp4a_gemm(
+    const int8_t* __restrict__ A, const uint32_t* __restrict__ B,
+    const half* __restrict__ w_scale, const float* __restrict__ a_scale,
+    half* __restrict__ C, int M, int N, int K) {
   const int tid = threadIdx.x;
   const int block_m = blockIdx.y * BLOCK_M;
   const int block_n = blockIdx.x * BLOCK_N;
