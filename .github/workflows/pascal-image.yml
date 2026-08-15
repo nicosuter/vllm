@@ -1,0 +1,114 @@
+name: Build Pascal image
+
+# Builds pascal/docker/Dockerfile and pushes to this repository's GHCR registry.
+#
+# Runs only on standard ubuntu-latest, which is the free tier; nothing here uses
+# macOS, Windows or larger runners. The path filter exists for the same reason:
+# compiling vLLM's extensions for sm_61 takes 1-2 hours on a 4-vCPU runner, so a
+# README commit must not start one.
+
+on:
+  push:
+    branches: [pascal]
+    paths:
+      - 'csrc/**'
+      - 'cmake/**'
+      - 'vllm/**'
+      - 'requirements/**'
+      - 'pascal/docker/**'
+      - 'CMakeLists.txt'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - '.github/workflows/pascal-image.yml'
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Push the image (uncheck to build only)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write          # GITHUB_TOKEN can write GHCR; no secret needed
+
+concurrency:
+  # A 1-2 hour build should not queue behind itself on a busy branch.
+  group: pascal-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350     # under the 360 job cap, so a hang fails cleanly
+
+    steps:
+      - name: Free disk space
+        # A stock runner leaves ~14 GB free, and the CUDA devel image alone is
+        # ~5 GB before any build artefacts. Removing preinstalled toolchains we
+        # do not use recovers roughly 25-30 GB and is the difference between
+        # this building and failing on ENOSPC partway through nvcc.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" \
+                      /usr/local/share/powershell /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # setuptools-scm reads tags for the version
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/pascal' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: pascal/docker/Dockerfile
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # ccache and the layer cache both live in the GHA cache, so an
+          # incremental change recompiles only what it touched rather than all
+          # of vLLM's extensions again.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            MAX_JOBS=4
+            VLLM_VERSION=0.27.2.dev0+pascal
+
+      - name: Summary
+        # Tags go through the environment rather than being interpolated into
+        # the script: they derive from ref names, and expanding those inline is
+        # the standard Actions script-injection footgun.
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Pascal image"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo
+            echo "Built for SM 6.1 only (TORCH_CUDA_ARCH_LIST=6.1), CUDA 12.6, torch cu126."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,9 +1,12 @@
 name: macOS Apple Silicon Smoke Test
 
+# Daily schedule removed for this fork. macOS runners bill at 10x the Linux
+# rate, this workflow carries no `github.repository` guard (unlike stale.yml),
+# and this repository is not a GitHub fork so GitHub will not auto-disable its
+# schedules. It remains available via workflow_dispatch; re-add a `schedule:`
+# block under `on:` to restore automatic runs.
+
 on:
-  schedule:
-    # Daily at 2:30 AM UTC
-    - cron: '30 2 * * *'
   workflow_dispatch:  # Manual trigger
 
 permissions:
