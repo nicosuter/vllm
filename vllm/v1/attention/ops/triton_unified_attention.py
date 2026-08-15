@@ -55,6 +55,50 @@ def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
     return data.to(Q.dtype)
 
 
+@triton.jit
+def _e4m3_to_f32(b):
+    """Reconstruct float32 from raw e4m3fn bits, without a hardware convert.
+
+    Triton refuses the ``fp8e4nv`` type outright below SM89 ("type fp8e4nv not
+    supported in this architecture"), so on Ampere the cache is loaded as raw
+    ``uint8`` and decoded here. e4m3fn is 1 sign bit, 4 exponent bits at bias 7,
+    and 3 mantissa bits, with no infinities.
+
+    Normals assemble straight into float32 bits: the exponent rebiases as
+    ``e - 7 + 127 == e + 120`` and the mantissa left-shifts from 3 places to 23.
+    Subnormals (``e == 0``) carry no implicit leading one and are worth
+    ``m * 2**-9``, which is cheaper to build in floating point than to
+    renormalise by hand. NaN (``0x7f`` / ``0xff``) decodes to a large finite
+    value rather than NaN; a KV cache holding NaN is already broken.
+
+    Verified bit-exact against PyTorch on all 254 finite byte values by
+    ``ampere/probes/fp8_dequant_sm86.py``.
+    """
+    u = b.to(tl.uint32)
+    sign = (u >> 7) & 1
+    exp = (u >> 3) & 0xF
+    man = u & 0x7
+
+    normal = (((exp + 120) << 23) | (man << 20)).to(tl.float32, bitcast=True)
+    sub = man.to(tl.float32) * 0.001953125  # 2**-9
+
+    val = tl.where(exp == 0, sub, normal)
+    return tl.where(sign == 1, -val, val)
+
+
+@triton.jit
+def _cast_kv_tile_sw_fp8(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
+    """``_cast_kv_tile`` for Ampere, where ``data`` arrives as raw uint8.
+
+    Only the conversion differs; the scaling rules are the same, and the
+    per-token-head modes still apply their scales on S/P inside the loop.
+    """
+    val = _e4m3_to_f32(data)
+    if KV_QUANT_MODE == 1:
+        return (val * tl.load(tensor_scale)).to(Q.dtype)
+    return val.to(Q.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Tensor-descriptor (TD) helpers
 #
@@ -272,6 +316,9 @@ def kernel_unified_attention(
     # FP8_PER_TOKEN_HEAD (3). Sub-byte INT4 (4) uses its own
     # int4_per_token_head kernel, not this one.
     KV_QUANT_MODE: tl.constexpr = 0,
+    # Ampere: the KV cache pointers are uint8 views and the e4m3 decode happens
+    # in software, because Triton rejects the fp8e4nv type below SM89.
+    FP8_SW_DEQUANT: tl.constexpr = False,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     # Chunked / block-local attention.  ``CHUNK_LOOKBACK >= 0`` enables
@@ -489,8 +536,12 @@ def kernel_unified_attention(
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+        if FP8_SW_DEQUANT:
+            K = _cast_kv_tile_sw_fp8(K_load, Q, k_scale, KV_QUANT_MODE)
+            V = _cast_kv_tile_sw_fp8(V_load, Q, v_scale, KV_QUANT_MODE)
+        else:
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
         if USE_PER_TOKEN_HEAD_SCALES:
@@ -847,7 +898,23 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    # Decode an e4m3 KV cache without a hardware convert. Triton rejects the
+    # fp8e4nv type below SM89, so on Ampere the caller sets this and the cache
+    # is reinterpreted as uint8 before launch. Costs a few integer ops per
+    # element, which a bandwidth-bound attention kernel does not notice.
+    fp8_sw_dequant: bool = False,
 ):
+    # Reinterpreting is free: fp8 and uint8 are both one byte, so the view
+    # preserves shape and strides exactly. It has to happen before the strides
+    # below are read off `k` and `v`.
+    if fp8_sw_dequant:
+        assert kv_quant_mode in (
+            KVQuantMode.FP8_PER_TENSOR,
+            KVQuantMode.FP8_PER_TOKEN_HEAD,
+        ), f"fp8_sw_dequant does not handle {kv_quant_mode.name}"
+        k = k.view(torch.uint8)
+        v = v.view(torch.uint8)
+
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
@@ -1157,6 +1224,7 @@ def unified_attention(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
+        FP8_SW_DEQUANT=fp8_sw_dequant,
         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,

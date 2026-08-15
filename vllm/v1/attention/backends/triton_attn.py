@@ -514,21 +514,32 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        self.fp8_sw_dequant = False
         if current_platform.is_cuda():
             cap = current_platform.get_device_capability()
             cap_str = cap.as_version_str() if cap is not None else "unknown"
             dev = current_platform.get_device_name()
+            # SM80/SM86 have no `cvt` from e4m3, and Triton refuses the type
+            # outright ("type fp8e4nv not supported in this architecture"), so
+            # the kernel decodes the cache from raw uint8 instead. This is not a
+            # convenience: on these cards fp8 KV is what makes FlashInfer the
+            # only remaining backend, and FlashInfer cannot capture full CUDA
+            # graphs under spec decode, which costs 1.66x on a 3090 Ti pair.
+            # Triton attention declares AttentionCGSupport.ALWAYS, so allowing
+            # fp8 here is what buys full graphs back without giving up the
+            # smaller cache. See ampere/README.md.
             if self.kv_cache_dtype.startswith("fp8") and not (
                 current_platform.has_device_capability(89)
             ):
-                suggested = (
-                    "float16" if (cap is None or cap.to_int() < 80) else "bfloat16"
-                )
-                raise ValueError(
-                    f"FP8 KV cache is not supported by the Triton attention backend "
-                    f"on {dev} (compute capability {cap_str}); native FP8 (fp8e4nv) "
-                    f"requires SM89+. Re-run with --kv-cache-dtype {suggested}."
-                )
+                if current_platform.has_device_capability(80):
+                    self.fp8_sw_dequant = True
+                else:
+                    raise ValueError(
+                        f"FP8 KV cache is not supported by the Triton attention "
+                        f"backend on {dev} (compute capability {cap_str}); the "
+                        f"software e4m3 decode requires SM80+. Re-run with "
+                        f"--kv-cache-dtype float16."
+                    )
             if self.kv_cache_dtype == "bfloat16" and not (
                 current_platform.has_device_capability(80)
             ):
@@ -557,7 +568,13 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.chunk_lookback = chunk_lookback
-        self.supports_quant_query_input = current_platform.is_cuda()
+        # An fp8 query would have to be *loaded* as fp8, which is the one thing
+        # the software decode cannot paper over -- and it would buy nothing
+        # anyway, since fp8 tensor cores start at SM89. Keep Q in bf16/fp16 on
+        # Ampere and let K dequantize into it.
+        self.supports_quant_query_input = (
+            current_platform.is_cuda() and not self.fp8_sw_dequant
+        )
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
@@ -722,6 +739,7 @@ class TritonAttentionImpl(AttentionImpl):
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            fp8_sw_dequant=self.fp8_sw_dequant,
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
@@ -822,6 +840,25 @@ class TritonAttentionImpl(AttentionImpl):
         if is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
+        if self.fp8_sw_dequant:
+            # The Triton store needs native fp8e4nv to *encode*, which Ampere
+            # lacks just as it lacks the decode. Rather than reimplement
+            # round-to-nearest-even and e4m3 saturation in Triton, use the CUDA
+            # op, whose conversions are guarded only on __CUDA_ARCH__ < 800 and
+            # so have handled fp8 on Ampere for years. Identical signature.
+            from vllm import _custom_ops as ops
+
+            ops.reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
+            return
         triton_reshape_and_cache_flash(
             key,
             value,
