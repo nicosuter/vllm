@@ -379,6 +379,56 @@ correctness fix and not a performance one — `enforce_eager` is no longer
 which never involved the compiler at all. `bench.py --compile` exists to keep
 that separable.
 
+### The sm_70 floor is one PTX hint wide, and inductor is worth 1.18x
+
+The natural next question is why we cannot have a compiler backend at all. It
+turns out we can: `pascal/probes/inductor_sm61.py` runs inductor on this card.
+
+The floor is three `major >= 7` checks in torch — `has_triton`'s
+`cuda_extra_check`, `CudaInterface.is_triton_capable`, and a re-raise in the
+inductor scheduler. Lifting them is not enough on its own, and what stops it is
+much smaller than an architecture gap:
+
+```
+ptxas error: Modifier '.evict_last' on 'ld' requires .target sm_70 or higher
+```
+
+Inductor asks for cache-eviction hints on loads. They are advisory — they tell
+L1 what to discard first and change no result — so dropping them at Triton's
+`_str_to_eviction_policy`, the single funnel every policy passes through, costs
+a cache hint and nothing else. That is the whole of it: **the floor is one
+optional decoration wide.**
+
+One wrinkle worth recording, because it looks like a partial failure rather than
+a plumbing problem: inductor compiles in worker *subprocesses*, which do not
+inherit an in-process patch. 108 ptxas errors become 12, not 0.
+`TORCHINDUCTOR_WORKER_START=fork` makes the workers inherit it, which beats
+serialising compilation with `TORCHINDUCTOR_COMPILE_THREADS=1`.
+
+What it is worth, graphs held at `full`, same slope measurement as `bench.py`:
+
+| backend | ms/step | decode tok/s |
+|---|---|---|
+| `eager` | 12.46 | 80.28 |
+| **`inductor`** | **10.55** | **94.76** |
+
+**1.18x**, and the fastest decode recorded on this card. That is much more than
+the "pointwise fusion against a 2.8% slice" argument predicts, so where it comes
+from has not been established — this is a measurement, not yet an explanation.
+
+Not bit-identical, and it should not be expected to be: fusion reassociates
+reductions. Against the eager path's own greedy output, worst prefix agreement
+was **97%** — a single token differing at position 31 of 32 on one prompt, with
+the other three identical. A second run at `COMPILE_THREADS=1` scored 100%, so
+the disagreement moves between runs, which is what autotuning picking different
+configs looks like. Late divergence on a near-tie is what the gate already
+tolerates; an early one would not be.
+
+Not wired in. `get_compile_backend()` returns `simple_compile_backend`, which is
+pinned to `eager` here, so inductor has to be asked for explicitly. Turning it on
+by default means owning the patches at import and re-verifying every model, and
+that is a larger change than the probe that justifies it.
+
 ## Model coverage
 
 Which checkpoints run on this card, and why the ones that do not fail:
