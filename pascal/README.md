@@ -188,3 +188,62 @@ this card.
 Attention resolves the same way: `TritonAttentionBackend.supports_compute_capability`
 returns `True` unconditionally, and `gdn_attn` handles the 18 Gated DeltaNet
 layers.
+
+### The runtime changes, and the one that was not obvious
+
+Building was the easy half. Four separate places assumed hardware we do not have
+and killed the engine before or during generation:
+
+| Change | Why |
+|---|---|
+| `fa_utils` imports FA lazily | `model_executor.layers.attention` pulls it in unconditionally, so a build without the FA extension made *every* model architecture uninspectable |
+| `topk_topp_sampler` treats missing flashinfer as a reason, not an error | It imported flashinfer purely to decide whether to use it |
+| compressed-tensors capability floors lowered to 60 | 70 (config) and 75 (wNa16) both date from when Marlin was the only wNa16 kernel |
+| rotary embedding falls back to `forward_native` | Its only CUDA-specific ingredient is flash-attention's fused `apply_rotary_emb` |
+
+The one worth remembering: **`torch.compile` has a stricter floor than Triton.**
+Inductor raises `GPUTooOldForTriton` below sm_70 regardless of what Triton
+itself supports — so an error that names Triton as unsupported appears on a card
+where Triton demonstrably works, and where vLLM had already compiled and run
+hundreds of Triton kernels. It surfaced late, mid-generation, inside the
+sampler's `@torch.compile`d `batched_count_greater_than`, well after startup and
+weight loading had succeeded. `enforce_eager` does not cover it: that disables
+compilation of the *model*, not of standalone decorated helpers.
+
+Fourteen sites read `current_platform.simple_compile_backend` at import time to
+decorate functions, so the fix belongs on the platform, once:
+`CudaPlatform.simple_compile_backend = "eager"` below sm_70.
+
+## Status
+
+**v1 green gate: met.** `cyankiwi/Qwen3.5-2B-AWQ-4bit` generates correct text on
+the GTX 1070 Ti.
+
+```
+>>> 'The capital of Switzerland is'
+    ' Bern. ... Bern is the capital city of Switzerland,'
+>>> 'def fibonacci(n):\n    '
+    ' if n == 0:\n         return 0\n     elif n == 1:\n         return 1\n     else:\n         return fibonacci'
+>>> 'In one sentence, explain why the sky is blue:'
+    'The sky appears blue because the short wavelengths of sunlight are scattered
+     more efficiently by air molecules than the longer wavelengths, ... known as Ray[leigh]'
+>>> 'List three prime numbers greater than 100:'
+    ' 101, 103, 107.'
+```
+
+Measured on the card, text-only, `--enforce-eager`, no performance work yet:
+
+| | |
+|---|---|
+| Output throughput | **11.7 tok/s** |
+| Weights on GPU | 1.83 GiB |
+| KV cache | 3.7 GiB / **173,494 tokens** |
+| Attention backend | `TRITON_ATTN` |
+| Compile backend | `eager` |
+
+The KV cache figure is worth noting: there was never any need for the
+short-context compromise that an 8 GB card seems to imply. At 2.4 GB of INT4
+weights, the card has room to spare — including for the v2 vision tower.
+
+First startup is slow (many minutes) because Triton autotunes and compiles every
+kernel for sm_61. The cache lives on the PVC, so later starts skip it.
