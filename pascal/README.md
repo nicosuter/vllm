@@ -224,7 +224,7 @@ the Triton kernel already verified on sm_61.
 | Requested | Tested as | Size | Status |
 |---|---|---|---|
 | `cyankiwi/Qwen3.5-2B-AWQ-4bit` | as requested | 2.4 GB | **Green gate.** 11.7 tok/s, 21.4 with MTP |
-| `ibm-granite/granite-4.1-3b` | `cyankiwi/granite-4.1-3b-AWQ-INT4` | 2.3 GB | see below |
+| `ibm-granite/granite-4.1-3b` | `cyankiwi/granite-4.1-3b-AWQ-INT4` | 2.3 GB | **Works.** 16.8 tok/s |
 | `Qwen/Qwen3-VL-Embedding-2B` | as requested, fp16 | 4.3 GB | see below |
 | `Qwen/Qwen3-VL-Reranker-2B` | as requested, fp16 | 4.3 GB | see below |
 | `google/gemma-4-E2B-it-qat-q4_0-unquantized` | `google/gemma-4-E2B-it-qat-w4a16-ct` | 8.3 GB | needs `cpu_offload_gb`; see below |
