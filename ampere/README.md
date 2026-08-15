@@ -47,9 +47,11 @@ sustained load on the pair before any kernel work is justified by it.
 For reference, the bandwidth roofline for a batch-1 decode step: ~8.8 GB read
 per target forward per GPU (backbone at 4 bits plus a TP-sharded 248320×5120
 bf16 lm_head), plus three cheap MTP draft forwards, ≈ 12.6 ms per step over
-3.08 tokens ≈ **4 ms/token**. Measured is 15x that. Somewhere between "the card
-was asleep" and "a kernel is wrong" lies the answer, and this directory exists
-to find out which.
+3.08 tokens ≈ **4 ms/token**. Measured is 15x that, and the cheap explanation is
+gone: the card was not asleep. Part of the gap is the CUDA-graph downgrade
+(H2, worth 1.42x on the proxy), part is per-request overhead the health-check
+sample exaggerates, and whatever remains after those two are accounted for is
+the part worth profiling.
 
 ## Hypotheses, ranked
 
