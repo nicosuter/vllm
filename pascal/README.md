@@ -374,15 +374,43 @@ correct text on the GTX 1070 Ti, and MTP speculative decoding works.
     ' 101, 103, 107.'
 ```
 
-Measured on the card, text-only, `--enforce-eager`, no performance work yet:
+| | |
+|---|---|
+| Weights on GPU | 1.83 GiB (1.88 with MTP) |
+| KV cache | 3.7 GiB / **173,494 tokens** |
+| Attention backend | `TRITON_ATTN` |
+| Compile backend | `eager` |
+| Quantized GEMM | `ExllamaLinearKernel` |
 
-| | without MTP | with MTP (`--mtp 1`) |
-|---|---|---|
-| Output throughput | 11.71 tok/s | **21.39 tok/s** (1.83×) |
-| Weights on GPU | 1.83 GiB | 1.88 GiB |
-| KV cache | 3.7 GiB / **173,494 tokens** | |
-| Attention backend | `TRITON_ATTN` | |
-| Compile backend | `eager` | |
+### Performance
+
+Decode throughput, batch 1, measured by `pascal/scripts/bench.py`:
+
+| | ms/step | decode tok/s | vs baseline |
+|---|---|---|---|
+| as ported | 55.34 | 18.07 | — |
+| fp32 `dot22_8_f` | 32.00 | 31.25 | 1.73× |
+| **+ fp32 int4 dequant** | **13.73** | **72.82** | **4.03×** |
+
+Both changes are the same finding applied twice: `__hfma2` runs at 1/56 the
+fp32 rate on this card (`pascal/probes/fp16_rate.cu`), and the exllama GEMM --
+which is 75% of device time and every quantized linear layer -- was built
+entirely out of it. Nothing upstream guards this because no other supported
+architecture is penalised for native fp16.
+
+Two things this is *not*:
+
+- **Not CUDA graphs.** Measured and rejected: 55.34 / 56.07 / 55.55 ms/step for
+  `none` / `full_decode_only` / `full`, with 35 graphs genuinely captured. Graph
+  capture works on sm_61; launch overhead simply is not the constraint.
+- **Not attention.** Triton attention, Gated DeltaNet and conv1d together are
+  2.8% of device time. The Triton FMA lowering that this fork was expected to
+  live or die by costs almost nothing on the decode path.
+
+Throughput is measured by slope -- two output lengths, differenced -- so prefill
+and setup cancel rather than being smeared into the number. The v1 figure of
+11.71 tok/s quoted earlier in this project was vLLM's own end-to-end number over
+four prompts and is not comparable; 18.07 is the same build measured this way.
 
 MTP needs no second checkpoint: vLLM resolves the architecture to `Qwen3_5MTP`
 and builds the drafter from the same weights, which is why this checkpoint
