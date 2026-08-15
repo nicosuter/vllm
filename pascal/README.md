@@ -226,9 +226,39 @@ the Triton kernel already verified on sm_61.
 | `cyankiwi/Qwen3.5-2B-AWQ-4bit` | as requested | 2.4 GB | **Green gate.** 11.7 tok/s, 21.4 with MTP |
 | `ibm-granite/granite-4.1-3b` | `cyankiwi/granite-4.1-3b-AWQ-INT4` | 2.3 GB | **Works.** 16.8 tok/s |
 | `Qwen/Qwen3-VL-Embedding-2B` | as requested, fp16 | 4.3 GB | **Works.** dim 2048, related pair leads by 0.52 cosine |
-| `Qwen/Qwen3-VL-Reranker-2B` | as requested, fp16 | 4.3 GB | see below |
+| `Qwen/Qwen3-VL-Reranker-2B` | as requested, fp16 | 4.3 GB | **Works** via yes/no logits; vLLM's score() path cannot load it |
 | `google/gemma-4-E2B-it-qat-q4_0-unquantized` | `google/gemma-4-E2B-it-qat-w4a16-ct` | 8.3 GB | needs `cpu_offload_gb`; see below |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | — | 3.9 GB | **Not supported by vLLM** (arch absent upstream too) |
+
+### The reranker works, but not through vLLM's scoring API
+
+`Qwen3-VL-Reranker-2B` has no scoring head to load. `1_LogitScore/` contains
+only `{"true_token_id": 9693, "false_token_id": 2152}` — tokens that decode to
+`"yes"` and `"no"` — and the checkpoint holds no classifier tensors at all. The
+relevance score *is* the LM logit of yes against no.
+
+vLLM cannot drive that through `score()`. Doing so needs a
+`*ForSequenceClassification` architecture with `classifier_from_token`, and vLLM
+implements those for Bert, GPT2, Llama, Jamba, ModernBert and Roberta only —
+there is no Qwen3-VL variant. `--convert classify` gets as far as building a head
+and then fails with `Scoring API is only enabled for num_labels == 1`. **This is
+a vLLM gap, not a Pascal one; it would fail the same way on an H100.**
+
+Running the model generatively and reading the two logits exercises the same
+kernels and gives the real score:
+
+```
+query                              doc0    doc1
+How do I bake sourdough bread at    1.000   0.000
+What causes the aurora borealis?    0.000   1.000
+```
+
+Worth recording the trap, because it nearly passed silently: with
+`--convert auto`, vLLM resolves the reranker to **embed** and `score()` returns
+the cosine between query and document *embeddings*. That still ranks roughly
+correctly — 0.894 / 0.883 / 0.868 in the first attempt here — so it looks like a
+pass. The giveaway is the compression: those are cosines of related English
+text, and the ranking head was never involved.
 
 ### Text-to-speech does not run on vLLM, on any GPU
 
