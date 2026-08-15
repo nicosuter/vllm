@@ -2,24 +2,22 @@ name: Build Pascal image
 
 # Builds pascal/docker/Dockerfile and pushes to this repository's GHCR registry.
 #
-# Runs only on standard ubuntu-latest, which is the free tier; nothing here uses
-# macOS, Windows or larger runners. The path filter exists for the same reason:
-# compiling vLLM's extensions for sm_61 takes 1-2 hours on a 4-vCPU runner, so a
-# README commit must not start one.
+# Tags only. Compiling vLLM's extensions for sm_61 takes 1-2 hours on a 4-vCPU
+# runner and there is no precompiled wheel to fall back on, so this must not run
+# on ordinary commits -- a path filter would still fire on every source change,
+# which for this fork is most of them. Cutting a tag is the explicit signal that
+# an image is wanted.
+#
+# Runs only on standard ubuntu-latest, the free tier. Nothing here uses macOS,
+# Windows or larger runners.
+#
+# Publishing a GitHub release from an *existing* tag does not push a new tag and
+# so does not trigger this; use the manual run for that.
 
 on:
   push:
-    branches: [pascal]
-    paths:
-      - 'csrc/**'
-      - 'cmake/**'
-      - 'vllm/**'
-      - 'requirements/**'
-      - 'pascal/docker/**'
-      - 'CMakeLists.txt'
-      - 'setup.py'
-      - 'pyproject.toml'
-      - '.github/workflows/pascal-image.yml'
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       push:
@@ -77,7 +75,7 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha,format=short
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/pascal' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
