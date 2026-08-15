@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Copy this directory to `ampere/k8s/local/` (which is gitignored) and fill in
+# the values for your cluster. Then:
+#
+#     kubectl create namespace vllm-ampere
+#     kubectl apply -k ampere/k8s/local
+#
+# Nothing in here belongs in version control: node names, storage classes and
+# namespaces describe one particular cluster, not the fork.
+
+resources:
+  - ../
+
+namespace: vllm-ampere
+
+patches:
+  # Pin to the node holding the 3090 Ti pair. Required whenever the cluster has
+  # GPUs of more than one architecture: nvidia.com/gpu does not distinguish
+  # them, so without this the scheduler will happily land this pod on an Ada or
+  # Pascal node and every sm_86 conclusion drawn from it will be wrong.
+  #
+  # A label selector is the better choice if you have more than one Ampere box:
+  #   nvidia.com/gpu.product: NVIDIA-GeForce-RTX-3090-Ti
+  - target:
+      kind: Pod
+      name: ampere-dev
+    patch: |-
+      - op: add
+        path: /spec/nodeSelector
+        value:
+          kubernetes.io/hostname: REPLACE_ME_NODE_NAME
+
+  # Only needed if the default StorageClass is unsuitable. The PVC carries the
+  # model checkpoint, the Triton and vLLM compile caches, and profile traces.
+  - target:
+      kind: PersistentVolumeClaim
+      name: ampere-dev
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: REPLACE_ME_STORAGE_CLASS

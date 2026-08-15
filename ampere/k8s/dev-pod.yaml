@@ -1,0 +1,84 @@
+# Long-lived dev/measurement pod for the Ampere branch.
+#
+# It sleeps rather than running anything as its entrypoint, because the work
+# here is iterative measurement: each probe answers one question and suggests
+# the next, and that should cost an `exec` rather than a fresh pod.
+#
+# It requests BOTH cards. That is not convenience -- three of the four open
+# hypotheses (all-reduce cost, CUDA-graph mode under spec decode, and the
+# baseline itself) are properties of the TP=2 configuration and cannot be
+# measured on one GPU. On a two-card box this means the pod and the production
+# deployment cannot coexist; see README.md.
+#
+# The image is the stock vLLM release, not a CUDA devel image, because the
+# first increment changes only Python. Swap it for nvidia/cuda:*-devel and run
+# scripts/build.sh if the work reaches the kernels.
+#
+# Node pinning and storage class are deployment-specific and deliberately
+# absent: supply them from a local overlay (see README.md in this directory).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ampere-dev
+  namespace: vllm-ampere
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 120Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ampere-dev
+  namespace: vllm-ampere
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  containers:
+    - name: dev
+      image: vllm/vllm-openai:v0.27.1-x86_64
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      env:
+        - name: TORCH_CUDA_ARCH_LIST
+          value: "8.6"
+        # Triton autotunes per shape on first use. Parking the cache on the PVC
+        # keeps a pod restart from re-paying it, and keeps JIT compilation out
+        # of the profile traces, where it would swamp every real kernel.
+        - name: TRITON_CACHE_DIR
+          value: /work/.triton
+        - name: VLLM_CACHE_ROOT
+          value: /work/.vllm
+        - name: HF_HOME
+          value: /work/hf
+        - name: CCACHE_DIR
+          value: /work/.ccache
+        # Spawn, not fork: the TP=2 workers each hold a CUDA context, and fork
+        # after CUDA init is undefined behaviour.
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: spawn
+        - name: TOKENIZERS_PARALLELISM
+          value: "false"
+      resources:
+        limits:
+          nvidia.com/gpu: 2
+          memory: 100Gi
+        requests:
+          cpu: "8"
+          memory: 58Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: work
+      persistentVolumeClaim:
+        claimName: ampere-dev
+    # NCCL and the TP=2 workers communicate through shared memory; the 64 MiB a
+    # container gets by default is far too small and fails in ways that look
+    # like a hang rather than an error.
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
