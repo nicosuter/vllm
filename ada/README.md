@@ -42,31 +42,101 @@ is not a throughput workload; it is almost pure single-stream decode. Batching
 work is close to worthless, and anything that reduces bytes-read-per-step or
 per-step overhead is worth its weight.
 
-**Decode roofline.** Per step at batch 1, approximately:
+## Measured on the card: the decode step, by kernel
 
-| component | bytes |
-|---|---|
-| lm_head (tied `embed_tokens`, fp16, unquantized) | **1.48 GB** |
-| MoE experts (8 of 128, 30 layers, ~4.5 bits effective) | ~0.80 GB |
-| attention projections | ~0.4 GB |
-| **total** | **~2.7 GB** |
+Taken on the 4090 itself in the production nightly (`65b7662d3`), batch 1, 128
+decode tokens, `kv_cache_dtype=fp8`. This replaces an earlier roofline estimate
+that was wrong in a way worth stating plainly: **it omitted the dense MLP**, and
+so understated traffic by 40% and overstated the available headroom.
 
-At 1008 GB/s that is a 373 tok/s ceiling against 127 measured — **34% of
-memory bandwidth**, so there is roughly 2.5x of headroom before the card is the
-limit. And the output projection alone is over half the traffic.
+**The card is never idle.** Device-busy time is 5.741 ms/step; the same
+generation with the profiler off runs at 5.723–5.751 ms/token. Those agree to
+within half a percent, so essentially the whole step is the GPU computing, and
+the 6% "idle" the profiler reports is the profiler's own overhead. Full CUDA
+graphs are captured (`Capturing CUDA graphs (decode, FULL)`), so Gemma never hits
+the PIECEWISE downgrade that costs `ampere/` 1.42x. **There is no launch-overhead
+problem here and no graph work worth doing.** Decode is bandwidth-bound, full
+stop.
+
+| component | kernel | per step | bytes | achieved |
+|---|---|---|---|---|
+| **lm_head** (fp16, tied) | cuBLAS `gemvx` | 1.541 ms | 1.476 GB | **958 GB/s** |
+| **dense MLP** gate+up (fp16) | cuBLAS `gemvx` | 0.830 ms | 0.714 GB | 860 GB/s |
+| **dense MLP** down (fp16) | cuBLAS `gemvx` | 0.445 ms | 0.357 GB | 802 GB/s |
+| MoE experts (int4) | `marlin_moe_wna16` | 1.112 ms | 0.803 GB | 722 GB/s |
+| attention proj (int4) | `marlin` | 0.865 ms | ~0.624 GB | ~721 GB/s |
+| MoE routing/gather | | 0.228 ms | | |
+| attention | `kernel_unified_attention` | 0.149 ms | | |
+| **total** | | **5.72 ms** | **~3.97 GB** | **694 GB/s** |
+
+The card's practical ceiling, measured on the same pod, is **919 GB/s** on a
+large device-to-device copy — 91% of the 1008 GB/s spec. Percentages below are
+against that, not against the spec sheet.
+
+So the real roofline is ~3.97 GB/step → **232 tok/s**, and 175 measured is **75%
+of achievable bandwidth**, not the 34% the old estimate implied. The headroom is
+1.3x, not 2.5x, and it is not where the estimate said it was.
+
+Two rows deserve attention. **lm_head is at the roofline** — 958 GB/s against a
+919 GB/s measured copy ceiling means no kernel can improve it; only reading fewer
+bytes can. And the *quantized* kernels are the slow ones: Marlin sits at ~722
+GB/s, about 78% of achievable, while the unquantized cuBLAS GEMVs reach 87–100%.
+
+The attention-projection byte count is derived from config shapes (heterogeneous
+head dims, `attention_k_eq_v`, `v_proj` present in only 25 of 30 layers) and is
+the one row to re-derive before quoting it.
 
 ## Hypotheses
 
-**A1 — The tied fp16 lm_head is the majority of every decode step.** 1.48 GB of
-~2.7 GB. Quantizing it to int8 would cut the step to ~1.95 GB (a **+38%**
-roofline) and free ~740 MiB, which is another **+16%** of KV cache on a model
-whose concurrency is 1.43x. `final_logit_softcapping: 30.0` already bounds the
-logit range, which is favourable.
+**A1 — The tied fp16 lm_head. CONFIRMED, and it is 27% of the step, not the
+majority.** 1.541 ms of 5.72, reading 1.476 GB at 958 GB/s. It is the single
+largest kernel and it is already at the roofline, so the only way to make it
+cheaper is to read fewer bytes. `final_logit_softcapping: 30.0` already bounds
+the logit range, which is favourable.
 
-This is a checkpoint change and belongs to whoever owns the quantization, not to
+**A1b — the dense MLP is also fp16, and nobody had noticed. NEW.** Every layer
+carries a dense MLP alongside its routed experts (`intermediate_size: 2112`
+beside `moe_intermediate_size: 704`, `enable_moe_block: true`), and the
+checkpoint leaves all three of its projections unquantized:
+
+```
+layers.N.mlp.gate_proj   {'F16': 30}          <- fp16
+layers.N.mlp.up_proj     {'F16': 30}          <- fp16
+layers.N.mlp.down_proj   {'F16': 30}          <- fp16
+layers.N.self_attn.*     {'I64','I32','F16'}  <- packed int4
+layers.N.experts.*       {'I64','I32','F16'}  <- packed int4
+```
+
+That is **1.07 GB per step**, comparable to lm_head's 1.48, and 22% of decode
+time. It is not a deliberate exclusion: `quantization_config.ignore` names only
+the vision tower, and `config_groups` targets `Linear` at 4 bits.
+
+Together A1 and A1b mean **2.55 GB of the 3.97 GB read per step — 64% — is fp16
+weights that the rest of the checkpoint already demonstrates can be int4.**
+Quantizing both would take the step to roughly 2.1 GB, close to a 2x on a
+decode that is otherwise at 75% of achievable bandwidth. This is by a wide
+margin the largest result on this branch.
+
+Both are checkpoint changes and belong to whoever owns the quantization, not to
 this branch. What this branch owes them is the measurement rather than the
-arithmetic: `probes/decode_profile.py` sizes the vocab projection against
-everything else, so the decision is made on a number.
+arithmetic, and `probes/decode_profile.py` now supplies it.
+
+**A5 — Marlin at M=1 leaves ~22% of bandwidth on the table. Real, and small.**
+The quantized kernels run at ~722 GB/s where the unquantized cuBLAS GEMVs reach
+802–958 and the card copies at 919. Lifting Marlin to ~90% of achievable would
+save about 0.4 ms of a 5.72 ms step — **roughly 7%**. That is the honest size of
+the "write a better batch-1 W4A16 GEMV" idea on this model, and it is an order of
+magnitude smaller than A1+A1b.
+
+Two things that idea should not be sold on, because both were checked and are
+false. MoE Marlin is a *grouped* GEMM — `marlin_moe_wna16/marlin_template.h`
+selects `expert_id` per block — so `marlin_moe.py` issues two launches per layer
+regardless of top-k, about 60 per token rather than the 240 a per-expert reading
+suggests; there is no per-expert launch overhead. And "a GEMM-shaped kernel
+wastes work at M=1" is true about arithmetic and irrelevant to cost: an 8-row
+tile reads the same weight bytes as a 1-row tile, the operation is bandwidth-
+bound, and Marlin already narrows to `m_block_size_8` below M=8. The gap is real
+but it has to be argued from the 722 GB/s, not from tile shapes.
 
 **A2 — 25 of 30 layers are on Triton for their neighbours' sake.**
 `Gemma4Config.verify_and_update_config` forces `TRITON_ATTN` model-wide when
@@ -82,6 +152,27 @@ kernel runs it; prefill is where attention scales with the 3,926-token mean
 prompt. `probes/attn_backend_split.py` measures both separately, and needs no
 patch to do it: `Gemma4Config` only sets `attention_config.backend`, while
 `selector.py` resolves `backend_per_kind` ahead of it.
+
+**Measured, and the expectation held — but the prize is far smaller than
+"25 of 30 layers" suggests.** The forcing is confirmed on the real deployment:
+`Using AttentionBackendEnum.TRITON_ATTN backend` is logged once per attention
+group, so both the sliding and the full layers are on Triton. Attention is:
+
+| | attention share of device time | A2 ceiling (25/30 layers) |
+|---|---|---|
+| decode, batch 1 | 2.6% | 2.2% |
+| prefill, 3,958-token prompt | 16.7% | 13.9% |
+
+The 6x difference between the two confirms A2 is a prefill change. But one
+3,958-token prefill costs only **12.6 ms of device time**, so 13.9% of it is
+about **1.8 ms** — against a production TTFT of 206 ms, that is **under 1%**.
+TTFT on this deployment is dominated by scheduling and queueing, not by
+attention arithmetic.
+
+So A2 is correct, cheap, and nearly worthless here. It stays on the list because
+it is the one change that is genuinely this branch's to make rather than the
+quantization owner's, and because the ceiling grows with prompt length — but it
+should not be sold as a headline.
 
 **A3 — KV cache headroom is left on the table.** The engine's own startup log
 says `--kv-cache-memory=5746727424` (5.35 GiB) would fully use the requested
