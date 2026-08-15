@@ -449,17 +449,25 @@ the disagreement moves between runs, which is what autotuning picking different
 configs looks like. Late divergence on a near-tie is what the gate already
 tolerates; an early one would not be.
 
-**On by default**, in `vllm/platforms/cuda.py` alongside the existing sm_70
-block. The two attributes are deliberately split: `simple_compile_backend` stays
-`eager`, because that is what the fourteen `@torch.compile` helper sites read and
-nothing measured says they need inductor, while `get_compile_backend()` — which
-is what the *model* compile resolves through — returns `inductor`. Set
-`VLLM_PASCAL_INDUCTOR=0` to go back.
+Wired in `vllm/platforms/cuda.py` alongside the existing sm_70 block, with no
+switch of its own. `enforce_eager` already means "compile nothing", and turns
+graph capture off with it, so an eager run never reaches this backend and never
+pays for it. A non-eager run gets compilation and capture *together*, which is
+the only combination worth having — capture without compilation is the middle
+state this fork sat in, and it leaves the 1.18x on the table for nothing.
 
-Verified with the default path, no explicit `compilation_config`: the gate model
-reports `backend: inductor`, zero ptxas errors, 94.88 tok/s at 10.54 ms/step,
-and greedy output matching the eager reference; `Qwen2.5-1.5B-Instruct-FP8-dynamic`
-likewise loads and generates correctly.
+The two platform attributes are deliberately split: `simple_compile_backend`
+stays `eager`, because that is what the fourteen `@torch.compile` helper sites
+read and nothing measured says they need inductor, while `get_compile_backend()`
+— which the *model* compile resolves through — returns `inductor`. The lift
+fails closed: if triton or the torch internals it patches move, it reports so
+and the backend stays eager rather than half-applying.
+
+So non-eager changes the answers slightly, and `--enforce-eager` is the way out.
+Verified through the default path with no explicit `compilation_config`: the
+gate model reports `backend: inductor`, zero ptxas errors, 94.88 tok/s at
+10.54 ms/step, and greedy output matching the eager reference;
+`Qwen2.5-1.5B-Instruct-FP8-dynamic` likewise loads and generates correctly.
 
 ## Model coverage
 
@@ -488,7 +496,7 @@ correct text on the GTX 1070 Ti, and MTP speculative decoding works.
 | Weights on GPU | 1.83 GiB (1.88 with MTP) |
 | KV cache | 3.7 GiB / **173,494 tokens** |
 | Attention backend | `TRITON_ATTN` |
-| Compile backend | `inductor` (helpers stay `eager`; `VLLM_PASCAL_INDUCTOR=0` reverts) |
+| Compile backend | `inductor` unless `--enforce-eager` (helpers stay `eager`) |
 | Quantized GEMM | `ExllamaLinearKernel` |
 
 ### Performance
@@ -500,8 +508,12 @@ Decode throughput, batch 1, measured by `pascal/scripts/bench.py`:
 | as ported | 55.34 | 18.07 | — |
 | fp32 `dot22_8_f` | 32.00 | 31.25 | 1.73× |
 | + fp32 int4 dequant | 13.73 | 72.82 | 4.03× |
-| + CUDA graphs (`full`) | 12.37 | 80.82 | 4.47× |
-| **+ inductor** | **10.54** | **94.88** | **5.25×** |
+| + CUDA graphs (`full`), no compiler | 12.37 | 80.82 | 4.47× |
+| **+ inductor, i.e. any non-eager run** | **10.54** | **94.88** | **5.25×** |
+
+The third row is a waypoint rather than a configuration: graph capture without
+compilation is what this fork could reach before inductor ran, and there is no
+reason to run it now. Eager or the last row.
 
 Both changes are the same finding applied twice: `__hfma2` runs at 1/56 the
 fp32 rate on this card (`pascal/probes/fp16_rate.cu`), and the exllama GEMM --

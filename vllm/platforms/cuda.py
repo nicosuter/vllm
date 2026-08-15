@@ -1074,14 +1074,22 @@ if _compile_capability is not None and _compile_capability.to_int() < 70:
     # get_compile_backend() otherwise returns simple_compile_backend, which
     # would keep the model on eager along with the helpers.
     #
-    # Opt out with VLLM_PASCAL_INDUCTOR=0. Inductor fuses, so it reassociates
-    # reductions and is not bit-identical to eager -- worst greedy prefix
-    # agreement measured at 97%, one token of 32 on one prompt, and the
-    # position moves between runs as autotuning picks different configs.
-    if (
-        os.environ.get("VLLM_PASCAL_INDUCTOR", "1") != "0"
-        and _lift_inductor_floor_below_sm70()
-    ):
+    # No separate switch for it. enforce_eager already means "compile nothing",
+    # and it turns graph capture off with it, so an eager run never compiles and
+    # never pays for this. The lift below is still applied at import, but it is
+    # inert until something compiles: vLLM never reads torch's has_triton, and
+    # every reader outside _inductor is a dynamo or distributed path an eager
+    # run does not take.
+    #
+    # A non-eager run gets compilation and capture together, which is the only
+    # combination worth having: capture without compilation is the middle state
+    # this fork sat in, and it leaves the 1.18x on the table for nothing.
+    #
+    # Non-eager therefore changes answers slightly. Inductor fuses, so it
+    # reassociates reductions: greedy agreement against the eager path measures
+    # 97-100% run to run, a single late token on a near-tie whose position moves
+    # as autotuning picks different configs. --enforce-eager is the way out.
+    if _lift_inductor_floor_below_sm70():
         CudaPlatform.get_compile_backend = classmethod(lambda cls: "inductor")
 
 CudaPlatform.log_warnings()
