@@ -11,7 +11,7 @@ kind: Kustomization
 # namespaces describe one particular cluster, not the fork.
 
 resources:
-  - ../
+  - ../base
 
 namespace: vllm-ampere
 

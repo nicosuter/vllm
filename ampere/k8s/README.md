@@ -16,6 +16,16 @@ kubectl apply -k ampere/k8s/local
 
 `ampere/k8s/local/` is gitignored.
 
+## Why the base sits in its own directory
+
+`base/` and the overlays are siblings because kustomize refuses to build an
+overlay nested inside its own base: it reports `cycle detected: candidate root
+.../k8s contains visited root .../k8s/local`. Referencing the manifest file
+directly instead (`resources: [../dev-pod.yaml]`) trades that for a second
+refusal, since kustomize will not load a file above the overlay root without
+`--load-restrictor LoadRestrictionsNone`. Siblings are the only arrangement
+that works with a stock `kubectl apply -k`.
+
 ## This pod cannot share a box with the production deployment
 
 The dev pod asks for both cards, and on a two-card host that is all of them. A
