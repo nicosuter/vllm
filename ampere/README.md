@@ -18,10 +18,10 @@ and shares no code with this one.
 | P2P | **Not supported** (`nvidia-smi topo -p2p r` → `NS` both directions) |
 | NVLink | Links present, **no bridge fitted** (`nvidia-smi nvlink -s` → "all links are inActive") |
 | FP8 | No tensor-core FP8 on sm_86 — fp8 weights are a bandwidth win only, never a math win |
-| Idle state | Both cards sit at **pstate P8, 210 MHz, ~20 W** between requests |
+| Idle state | `nvidia-smi` reports pstate P8 / 210 MHz between requests. This is a sampling artifact, not a tax — see H1. |
 
-The three facts that shape everything below: there is no fast path between the
-two cards, sm_86 cannot do FP8 math, and the cards are usually asleep.
+The two facts that shape everything below: there is no fast path between the two
+cards, and sm_86 cannot do FP8 math.
 
 ## Measured baseline
 
@@ -56,11 +56,27 @@ to find out which.
 
 Each is falsifiable and none has been tested yet.
 
-**H1 — Idle clocks.** The engine goes fully idle between requests and the cards
-drop to P8/210 MHz. Interactive traffic pays the ramp on every request.
-*Probe:* `probes/clock_ramp.py`. *Fix if true:* lock minimum SM clocks; this is
-deployment config, not a fork change, but it must be excluded before anything
-else is believed.
+**H1 — Idle clocks. CLOSED, false.** Measured with `probes/clock_ramp.py` on an
+idle RTX 4090 (see "Where these were measured"), 8192³ bf16 matmul after 25 s of
+idle:
+
+```
+idle state: P8, 210 MHz, 26 W
+first iteration cold :    14.88 ms
+steady state (hot)   :     7.46 ms
+first-iteration tax  :     1.99x
+ramp to within 10%   :       22 ms of continuous work
+```
+
+The card is at full clocks 22 ms into a request, and the whole ramp costs about
+7 ms once. Against a production TTFT near 0.9 s and hundreds of decode tokens
+that is a rounding error, not a 15x. It cannot explain the baseline.
+
+Two things worth keeping. `nvidia-smi` reported `P8, 210 MHz` *while the burst
+was running* — the pstate you read between synchronisation points is the idle
+one, so "the GPUs sit at P8" is an artifact of when the sample lands and not
+evidence about anything. And the sm_89 card is a stand-in; if the 3090 Ti pair
+ever shows a materially different ramp, this reopens.
 
 **H2 — Full CUDA graphs are silently disabled.** vLLM picks FlashInfer
 (`Using FLASHINFER ... out of potential backends: ['FLASHINFER', 'TRITON_ATTN']`),
@@ -89,6 +105,34 @@ queries and served zero hits.
 *Fix if true:* decouple attention block size from the mamba page size for hybrid
 models. This is the largest change on the list and the one most likely to be
 worth upstreaming.
+
+## Where these were measured
+
+The 3090 Ti pair serves production and was unavailable, so the first round ran
+on the single RTX 4090 that normally serves Gemma, via the loaner overlay
+described in `k8s/README.md`. That card is **sm_89, not sm_86**, and the
+difference is not cosmetic: it has FP8 tensor cores, a different FlashAttention
+support matrix, and a different set of candidate attention backends for the same
+model.
+
+So the rule for anything measured there: **mechanism transfers, magnitude does
+not.** Whether the selector picks a backend that forfeits full CUDA graphs, and
+whether the hybrid layout forces a 1600-token block, are properties of the model
+and of vLLM's own logic. How many microseconds that costs is a property of the
+card, and has to be re-measured on the pair before it goes in a commit message.
+
+The proxy model is `cyankiwi/Qwen3.5-2B-AWQ-4bit`: same architecture as the
+27B — `Qwen3_5ForConditionalGeneration`, GDN linear attention interleaved with
+full attention at interval 4, `mtp_num_hidden_layers: 1`, `head_dim` 256 — at a
+size that fits one card.
+
+One trap already caught, recorded so it is not walked into twice: the first run
+of `cudagraph_modes.py` omitted `kv_cache_dtype=fp8` and passed the backend
+override as a bare string. fp8 changes which backends are candidates, and
+`AttentionBackendEnum` is a plain `Enum` that silently ignores a string, so both
+arms selected `FLASH_ATTN` and the probe cheerfully reported a comparison of a
+configuration against itself. The probe now refuses a run whose selected backend
+is not the one requested.
 
 ## Method
 

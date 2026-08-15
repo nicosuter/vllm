@@ -55,12 +55,21 @@ def child(args: argparse.Namespace) -> int:
         gpu_memory_utilization=args.gpu_frac,
         enforce_eager=False,
         trust_remote_code=True,
+        # Production parity, and not incidental: fp8 KV changes which backends
+        # are candidates at all. Omitting it made a first run of this probe
+        # select FLASH_ATTN on both arms and report a comparison of nothing.
+        kv_cache_dtype=args.kv_cache_dtype,
         # The 2B carries a vision tower it never uses here. Profiling it costs
         # memory that the KV cache wants and adds nothing to a decode result.
         limit_mm_per_prompt={"image": 0, "video": 0},
     )
     if args.backend != "auto":
-        kwargs["attention_backend"] = args.backend
+        # AttentionBackendEnum is a plain Enum, so a bare string is accepted by
+        # the dataclass and then quietly ignored -- the first run of this probe
+        # asked for TRITON_ATTN and measured FLASH_ATTN twice. Pass the member.
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        kwargs["attention_backend"] = AttentionBackendEnum[args.backend]
     if args.spec_tokens > 0:
         kwargs["speculative_config"] = {
             "method": "mtp",
@@ -130,6 +139,8 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
         str(args.gpu_frac),
         "--max-model-len",
         str(args.max_model_len),
+        "--kv-cache-dtype",
+        args.kv_cache_dtype,
     ]
     print(f"==> {backend}", flush=True)
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -149,6 +160,13 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
 
     downgrade = re.search(r"setting cudagraph_mode=(\w+)", blob)
     record["downgraded_to"] = downgrade.group(1) if downgrade else None
+
+    # A probe that measures a backend other than the one it asked for is worse
+    # than no probe, because the number looks legitimate. Refuse it.
+    if backend != "auto" and record.get("selected") not in (None, backend):
+        record["error"] = f"asked for {backend}, engine selected {record['selected']}"
+        print(f"    REJECTED: {record['error']}", flush=True)
+        return record
 
     if "ms_per_token_median" not in record:
         record["error"] = f"child exited {proc.returncode}"
@@ -177,6 +195,12 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--gpu-frac", type=float, default=0.85)
     ap.add_argument("--max-model-len", type=int, default=8192)
+    ap.add_argument(
+        "--kv-cache-dtype",
+        default="fp8",
+        help="production runs fp8; it changes the candidate backend set, so "
+        "'auto' means something different without it",
+    )
     ap.add_argument("--out", default="")
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--backend", default="auto", help=argparse.SUPPRESS)
