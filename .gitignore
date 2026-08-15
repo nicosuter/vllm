@@ -257,3 +257,6 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 
 # oh-my-claudecode operational state
 .omc/
+
+# Deployment-specific k8s overlay (node names, storage classes): never committed.
+pascal/k8s/local/

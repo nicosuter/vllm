@@ -1,4 +1,6 @@
-# Runs pascal/probes/triton_probe.py on the GTX 1070 Ti in <node>.
+# Runs pascal/probes/triton_probe.py on a Pascal GPU.
+#
+# Node pinning is supplied by a local overlay; see README.md in this directory.
 #
 # The probe script is injected via ConfigMap rather than baked into an image so
 # that iterating on it costs a kubectl apply instead of a container build. Torch
@@ -21,8 +23,6 @@ spec:
     spec:
       restartPolicy: Never
       runtimeClassName: nvidia
-      nodeSelector:
-        kubernetes.io/hostname: <node>
       containers:
         - name: probe
           # Full python image, not -slim: Triton compiles a small C driver shim

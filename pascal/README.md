@@ -29,19 +29,22 @@ tree. Edits to vLLM's own sources are made in place, as a hard fork should.
 
 ## The hardware
 
-One GTX 1070 Ti in node `<node>` of the <cluster> cluster (Talos, driver
-580.167.08). GP104, SM 6.1, 8 GB VRAM. The node has 28 vCPU and 24 GB RAM.
+One GTX 1070 Ti: GP104, SM 6.1, 8 GB VRAM, NVIDIA driver 580.167.08. The host
+has 28 vCPU and 24 GB RAM, which is what sets `MAX_JOBS=8` for the build (nvcc
+peaks near 2 GB per translation unit).
 
-Schedule onto it with:
+The manifests in `pascal/k8s/` request a GPU generically:
 
 ```yaml
 runtimeClassName: nvidia
-nodeSelector:
-  kubernetes.io/hostname: <node>
 resources:
   limits:
     nvidia.com/gpu: 1
 ```
+
+Pinning to a particular node or storage class is deployment-specific and is
+supplied by a local kustomize overlay that is not committed. See
+`pascal/k8s/README.md`.
 
 ### What SM 6.1 cannot do
 
@@ -98,7 +101,7 @@ That is an empirical question, so it is answered empirically. See
 ## Probe
 
 ```bash
-kubectl apply -f pascal/k8s/probe-job.yaml
+kubectl apply -k pascal/k8s/local
 kubectl -n vllm-pascal create configmap triton-probe-src \
   --from-file=triton_probe.py=pascal/probes/triton_probe.py \
   --dry-run=client -o yaml | kubectl apply -f -
@@ -107,7 +110,7 @@ kubectl -n vllm-pascal logs -l job-name=triton-probe -f
 
 ### Results
 
-Run 2026-08-15 on `<node>`, torch `2.13.0+cu126`, triton `3.7.1`:
+Run 2026-08-15 on the GTX 1070 Ti, torch `2.13.0+cu126`, triton `3.7.1`:
 
 ```
 torch.arch_list           PASS  GTX 1070 Ti sm_61; arch_list has sm_50/60/70/75/80/86/90; usable=['sm_60']
@@ -148,7 +151,7 @@ probe image is `python:3.12` and not `-slim`.
 ## Building
 
 ```bash
-kubectl apply -f pascal/k8s/build-pod.yaml
+kubectl apply -k pascal/k8s/local
 kubectl -n vllm-pascal exec -i pascal-build -- bash -s < pascal/scripts/setup-build-env.sh
 kubectl -n vllm-pascal exec -i pascal-build -- bash -s < pascal/scripts/build.sh
 ```
@@ -235,127 +238,8 @@ decorate functions, so the fix belongs on the platform, once:
 
 ## Model coverage
 
-Everything here is tested on the same single GTX 1070 Ti. Quantized variants are
-substituted wherever the headline model ships unquantized, because 8 GB does not
-hold bf16 weights plus a KV cache — and because compressed-tensors W4A16 lands on
-the Triton kernel already verified on sm_61.
-
-| Requested | Tested as | Size | Status |
-|---|---|---|---|
-| `cyankiwi/Qwen3.5-2B-AWQ-4bit` | as requested | 2.4 GB | **Green gate.** 11.7 tok/s, 21.4 with MTP |
-| `ibm-granite/granite-4.1-3b` | `cyankiwi/granite-4.1-3b-AWQ-INT4` | 2.3 GB | **Works.** 16.8 tok/s |
-| `Qwen/Qwen3-VL-Embedding-2B` | as requested, fp16 | 4.3 GB | **Works.** dim 2048, related pair leads by 0.52 cosine |
-| `Qwen/Qwen3-VL-Reranker-2B` | as requested, fp16 | 4.3 GB | **Works** via yes/no logits; vLLM's score() path cannot load it |
-| `google/gemma-4-E2B-it-qat-q4_0-unquantized` | `google/gemma-4-E2B-it-qat-w4a16-ct` | 8.3 GB | **Does not fit.** Three blockers cleared, OOM remains; see below |
-| `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | — | 3.9 GB | **Not supported by vLLM** (arch absent upstream too) |
-
-### Gemma 4 E2B does not fit this card, and the reason is structural
-
-Three separate blockers were found and cleared, and the fourth is the one that
-stops it. Recorded in order, because each had to be removed to see the next.
-
-**1. It does not fit in any quantization.** `embed_tokens_per_layer` is 4.375
-GiB and stays unquantized in every variant, so Google's W4A16 QAT release is
-still 7.745 GiB:
-
-```
-  4.375 GiB  model.language_model.embed_tokens_per_layer   <- unquantized
-  0.977 GiB  model.language_model.layers                   <- INT4
-  0.750 GiB  lm_head.weight
-  0.750 GiB  model.language_model.embed_tokens
-  0.568 GiB  model.audio_tower
-  0.312 GiB  model.vision_tower
-```
-
-**2. transformers incompatibility.** Cleared by pinning 5.8.1 plus two code
-fixes — see `get_maybe_per_layer_attr`. Not a Pascal problem.
-
-**3. A bf16 activation meeting an fp16 weight.** Gemma 4 is any-to-any, so
-declining only image and video still builds and profiles the **audio** tower,
-whose weights are in the quantization ignore list and therefore keep the
-checkpoint's bfloat16. They then meet fp16 weights:
-`expected mat1 and mat2 to have the same dtype, but got: c10::BFloat16 != c10::Half`.
-Declining audio as well fixes it and drops the load from 6.96 to 6.39 GiB.
-
-This one *is* Pascal-shaped: only Pascal is forced to convert the model to fp16,
-so only Pascal exercises the path where a bf16 island survives.
-
-**4. Out of memory, and `cpu_offload_gb` does not help.** 6.39 GiB of weights
-plus KV cache and activations exceeds 7.92 GiB. The load reports **6.39 GiB with
-and without** `--cpu-offload-gb 3.0`, so the offload is not reducing this
-model's resident footprint — its weights evidently do not go through the path
-that offload wraps.
-
-Making Gemma 4 E2B work here means offloading the per-layer embeddings
-specifically, which is what Gemma-3n's design intends: they are a per-token
-gather, cheap to keep in host RAM and cheap to transfer. That is real
-engineering, not a flag, and it is the honest next step rather than something
-this fork currently does.
-
-### The reranker works, but not through vLLM's scoring API
-
-`Qwen3-VL-Reranker-2B` has no scoring head to load. `1_LogitScore/` contains
-only `{"true_token_id": 9693, "false_token_id": 2152}` — tokens that decode to
-`"yes"` and `"no"` — and the checkpoint holds no classifier tensors at all. The
-relevance score *is* the LM logit of yes against no.
-
-vLLM cannot drive that through `score()`. Doing so needs a
-`*ForSequenceClassification` architecture with `classifier_from_token`, and vLLM
-implements those for Bert, GPT2, Llama, Jamba, ModernBert and Roberta only —
-there is no Qwen3-VL variant. `--convert classify` gets as far as building a head
-and then fails with `Scoring API is only enabled for num_labels == 1`. **This is
-a vLLM gap, not a Pascal one; it would fail the same way on an H100.**
-
-Running the model generatively and reading the two logits exercises the same
-kernels and gives the real score:
-
-```
-query                              doc0    doc1
-How do I bake sourdough bread at    1.000   0.000
-What causes the aurora borealis?    0.000   1.000
-```
-
-Worth recording the trap, because it nearly passed silently: with
-`--convert auto`, vLLM resolves the reranker to **embed** and `score()` returns
-the cosine between query and document *embeddings*. That still ranks roughly
-correctly — 0.894 / 0.883 / 0.868 in the first attempt here — so it looks like a
-pass. The giveaway is the compression: those are cosines of related English
-text, and the ranking head was never involved.
-
-### Text-to-speech does not run on vLLM, on any GPU
-
-Both TTS references were checked and neither is a Pascal problem — vLLM has no
-audio-generation path whatsoever.
-
-**`Qwen/Qwen3-TTS-12Hz-1.7B-Base`** declares `Qwen3TTSForConditionalGeneration` /
-`qwen3_tts`. That architecture appears **nowhere in vLLM**, not in our v0.27.1
-base and not in upstream `main` either. VRAM is not the limit: at 3.9 GB it
-would fit this card with room to spare, and the 0.6B variant more so. The
-architecture is simply unimplemented, so the smaller model does not help.
-
-**`hexgrad/Kokoro-82M`** (dropped from scope, recorded because it was checked) is
-further out still: it is not a transformer LM at all. Its `config.json` describes
-StyleTTS2 — an `istftnet` vocoder, a PLBERT text encoder, a duration predictor,
-`style_dim`/`n_mels` — ships a single `.pth`, and declares no `architectures`,
-no `model_type`, and no `library_name`.
-
-The natural next guess, that vLLM's "omni" models might provide a way in, does
-not work either. Every omni entry is a *thinker*:
-`Qwen2_5OmniThinkerForConditionalGeneration`,
-`Qwen3OmniMoeThinkerForConditionalGeneration`. `qwen2_5_omni_thinker.py` is
-explicit when loading weights:
-
-```python
-loader = AutoWeightsLoader(self, skip_prefixes=["talker.", "token2wav."])
-```
-
-The talker and token2wav stacks — the parts that emit audio — are skipped
-outright. vLLM's audio support is uniformly audio **in**, text **out**
-(`qwen2_audio`, `granite_speech`, `kimi_audio`, `qwen3_asr`, ...).
-
-Serving TTS on this card means a different runtime, not a different quantization.
-Qwen3-TTS runs under `transformers`; Kokoro under its own `kokoro` package or
-ONNX. Both are small enough that a 1070 Ti handles them without a serving engine.
+Which checkpoints run on this card, and why the ones that do not fail:
+[`pascal/MODELS.md`](MODELS.md).
 
 ## Status
 

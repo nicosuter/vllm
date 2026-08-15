@@ -1,0 +1,49 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Copy this directory to `pascal/k8s/local/` (which is gitignored) and fill in
+# the values for your cluster. Then:
+#
+#     kubectl apply -k pascal/k8s/local
+#
+# Nothing in here belongs in version control: node names, storage classes and
+# namespaces describe one particular cluster, not the fork.
+
+resources:
+  - ../
+
+# Namespace everything lands in. Create it first: kubectl create ns <name>
+namespace: vllm-pascal
+
+patches:
+  # Pin to the node holding the Pascal card. Required whenever the cluster has
+  # GPUs of more than one architecture, because nvidia.com/gpu does not
+  # distinguish them and a build compiled for sm_61 will not run elsewhere.
+  - target:
+      kind: Pod
+      name: pascal-build
+    patch: |-
+      - op: add
+        path: /spec/nodeSelector
+        value:
+          kubernetes.io/hostname: REPLACE_ME_NODE_NAME
+
+  - target:
+      kind: Job
+      name: triton-probe
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          kubernetes.io/hostname: REPLACE_ME_NODE_NAME
+
+  # Only needed if the default StorageClass is unsuitable -- the build PVC wants
+  # 80Gi of node-local-ish storage that survives pod restarts, since it carries
+  # ccache, the build tree, the venv, models and the Triton cache.
+  - target:
+      kind: PersistentVolumeClaim
+      name: pascal-build
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: REPLACE_ME_STORAGE_CLASS

@@ -14,10 +14,10 @@ context: |
   Green gate: `cyankiwi/Qwen3.5-2B-AWQ-4bit` generates correct text on a
   GTX 1070 Ti with MTP speculative decoding working.
 
-  Target hardware: single GTX 1070 Ti (GP104, SM 6.1, 8 GB VRAM) in node
-  <node> of the <cluster> Kubernetes cluster (Talos, driver 580.167.08).
-  Schedule GPU work with `runtimeClassName: nvidia` and
-  `nodeSelector: kubernetes.io/hostname: <node>`.
+  Target hardware: single GTX 1070 Ti (GP104, SM 6.1, 8 GB VRAM), NVIDIA
+  driver 580.167.08, reached as a Kubernetes GPU workload. Manifests request
+  `runtimeClassName: nvidia` and `nvidia.com/gpu: 1`; node and storage-class
+  pinning is deployment-specific and lives in an uncommitted local overlay.
 
   Hardware constraints that drive nearly every design decision:
     - No tensor cores. FlashAttention, FlashInfer, Marlin, Machete, CUTLASS

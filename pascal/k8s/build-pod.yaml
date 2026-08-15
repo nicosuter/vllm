@@ -6,8 +6,14 @@
 # and another full toolchain install. The PVC carries ccache and the build tree
 # across pod restarts.
 #
-# The GPU is attached so the same pod can run the model after building it. There
-# is exactly one Pascal card in this cluster, so holding it here is fine.
+# The GPU is attached so the same pod can run the model after building it, which
+# means the pod holds the card for as long as it exists.
+#
+# Node pinning and storage class are deployment-specific and deliberately absent:
+# supply them from a local overlay (see README.md in this directory). Without one
+# the PVC uses the cluster default StorageClass and the scheduler picks any node
+# advertising nvidia.com/gpu -- which is only correct if every such node is
+# Pascal, hence the overlay.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -15,7 +21,6 @@ metadata:
   namespace: vllm-pascal
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: <storage-class>
   resources:
     requests:
       storage: 80Gi
@@ -28,8 +33,6 @@ metadata:
 spec:
   restartPolicy: Never
   runtimeClassName: nvidia
-  nodeSelector:
-    kubernetes.io/hostname: <node>
   containers:
     - name: build
       # CUDA 12.6 devel: the last toolkit line that still emits sm_61 code.
@@ -50,7 +53,7 @@ spec:
         - name: CMAKE_BUILD_PARALLEL_LEVEL
           value: "8"
         # nvcc peaks around 2 GB per translation unit; 8 jobs against the
-        # node's 24 GB is the most this box will take without swapping.
+        # host's 24 GB is the most this box will take without swapping.
         - name: MAX_JOBS
           value: "8"
         - name: HF_HOME
