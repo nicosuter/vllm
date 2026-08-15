@@ -214,6 +214,57 @@ Fourteen sites read `current_platform.simple_compile_backend` at import time to
 decorate functions, so the fix belongs on the platform, once:
 `CudaPlatform.simple_compile_backend = "eager"` below sm_70.
 
+## Model coverage
+
+Everything here is tested on the same single GTX 1070 Ti. Quantized variants are
+substituted wherever the headline model ships unquantized, because 8 GB does not
+hold bf16 weights plus a KV cache — and because compressed-tensors W4A16 lands on
+the Triton kernel already verified on sm_61.
+
+| Requested | Tested as | Size | Status |
+|---|---|---|---|
+| `cyankiwi/Qwen3.5-2B-AWQ-4bit` | as requested | 2.4 GB | **Green gate.** 11.7 tok/s, 21.4 with MTP |
+| `ibm-granite/granite-4.1-3b` | `cyankiwi/granite-4.1-3b-AWQ-INT4` | 2.3 GB | see below |
+| `Qwen/Qwen3-VL-Embedding-2B` | as requested, fp16 | 4.3 GB | see below |
+| `Qwen/Qwen3-VL-Reranker-2B` | as requested, fp16 | 4.3 GB | see below |
+| `google/gemma-4-E2B-it-qat-q4_0-unquantized` | `google/gemma-4-E2B-it-qat-w4a16-ct` | 8.3 GB | needs `cpu_offload_gb`; see below |
+| `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | — | 3.9 GB | **Not supported by vLLM** (arch absent upstream too) |
+
+### Text-to-speech does not run on vLLM, on any GPU
+
+Both TTS references were checked and neither is a Pascal problem — vLLM has no
+audio-generation path whatsoever.
+
+**`Qwen/Qwen3-TTS-12Hz-1.7B-Base`** declares `Qwen3TTSForConditionalGeneration` /
+`qwen3_tts`. That architecture appears **nowhere in vLLM**, not in our v0.27.1
+base and not in upstream `main` either. VRAM is not the limit: at 3.9 GB it
+would fit this card with room to spare, and the 0.6B variant more so. The
+architecture is simply unimplemented, so the smaller model does not help.
+
+**`hexgrad/Kokoro-82M`** (dropped from scope, recorded because it was checked) is
+further out still: it is not a transformer LM at all. Its `config.json` describes
+StyleTTS2 — an `istftnet` vocoder, a PLBERT text encoder, a duration predictor,
+`style_dim`/`n_mels` — ships a single `.pth`, and declares no `architectures`,
+no `model_type`, and no `library_name`.
+
+The natural next guess, that vLLM's "omni" models might provide a way in, does
+not work either. Every omni entry is a *thinker*:
+`Qwen2_5OmniThinkerForConditionalGeneration`,
+`Qwen3OmniMoeThinkerForConditionalGeneration`. `qwen2_5_omni_thinker.py` is
+explicit when loading weights:
+
+```python
+loader = AutoWeightsLoader(self, skip_prefixes=["talker.", "token2wav."])
+```
+
+The talker and token2wav stacks — the parts that emit audio — are skipped
+outright. vLLM's audio support is uniformly audio **in**, text **out**
+(`qwen2_audio`, `granite_speech`, `kimi_audio`, `qwen3_asr`, ...).
+
+Serving TTS on this card means a different runtime, not a different quantization.
+Qwen3-TTS runs under `transformers`; Kokoro under its own `kokoro` package or
+ONNX. Both are small enough that a 1070 Ti handles them without a serving engine.
+
 ## Status
 
 **v1 green gate: met, including MTP.** `cyankiwi/Qwen3.5-2B-AWQ-4bit` generates

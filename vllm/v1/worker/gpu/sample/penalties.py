@@ -246,10 +246,22 @@ def _bincount_kernel(
         idx = prompt_tokens // 32
         bit_idx = prompt_tokens % 32
         bit = tl.full((BLOCK_SIZE,), 1, tl.int32) << bit_idx
+        # sem="relaxed" because Triton's default is "acq_rel", which emits PTX
+        # the assembler rejects below sm_70: "Feature '.acq_rel' requires
+        # .target sm_70 or higher". Acquire-release ordering only entered the
+        # PTX memory model at Volta.
+        #
+        # Relaxed is the correct ordering here regardless of hardware: this
+        # ORs independent bits into a mask, so the result depends on atomicity
+        # alone and not on ordering against other memory operations, and the
+        # kernel boundary supplies the visibility the host relies on. vLLM
+        # already uses sem="relaxed" for the same reason in the fused MoE LoRA
+        # kernels.
         tl.atomic_or(
             prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + idx,
             bit,
             mask=mask,
+            sem="relaxed",
         )
 
     if (block_idx + 1) * BLOCK_SIZE >= prompt_len:
@@ -258,12 +270,15 @@ def _bincount_kernel(
         output_tokens = tl.load(
             all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask
         )
+        # Relaxed for the same reason as the atomic_or above: counting into
+        # bins needs atomicity, not ordering.
         tl.atomic_add(
             output_bin_counts_ptr
             + req_state_idx * output_bin_counts_stride
             + output_tokens,
             1,
             mask=mask,
+            sem="relaxed",
         )
 
 

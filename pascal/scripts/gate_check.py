@@ -35,6 +35,7 @@ def run_vllm(
     gpu_frac: float,
     mtp_tokens: int = 0,
     text_only: bool = True,
+    max_batched_tokens: int = 2048,
 ):
     from vllm import LLM, SamplingParams
 
@@ -63,6 +64,7 @@ def run_vllm(
         enforce_eager=enforce_eager,
         gpu_memory_utilization=gpu_frac,
         max_model_len=2048,
+        max_num_batched_tokens=max_batched_tokens,
         trust_remote_code=True,
         **kwargs,
     )
@@ -131,6 +133,14 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--gpu-frac", type=float, default=0.85)
+    ap.add_argument(
+        "--max-batched-tokens",
+        type=int,
+        default=2048,
+        help="vLLM profiles a forward pass at this width before serving. The "
+        "default 8192 is sized for tensor-core hardware; on a 1070 Ti it makes "
+        "startup dominate the run without changing what is being tested.",
+    )
     ap.add_argument("--no-eager", action="store_true", help="allow CUDA graphs / torch.compile")
     ap.add_argument("--skip-reference", action="store_true", help="generation only, no CPU reference")
     ap.add_argument(
