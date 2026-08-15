@@ -76,10 +76,29 @@ ENV CCACHE_DIR=/ccache
 RUN --mount=type=cache,target=/ccache \
     pip install --no-cache-dir --no-build-isolation -e . -v
 
+# torchaudio and torchcodec arrive transitively (transformers 5.x pulls them for audio/video)
+# from the DEFAULT index, so they are cu13 wheels whose .so files want libcudart.so.13 while
+# everything here is cu126. requirements/pascal.txt already calls torchcodec out of scope; this
+# is what makes that true of the built image rather than only of the requirements file.
+#
+# Uninstalling rather than pinning is deliberate: neither is needed to serve text, and both
+# libraries are ALREADY optional to vLLM -- vllm/multimodal/video.py wraps the torchcodec
+# import and falls back to a PlaceholderModule. That guard catches (ImportError, RuntimeError)
+# and torch.ops.load_library raises OSError, so a present-but-broken wheel is strictly worse
+# than an absent one: absent degrades, broken kills the process at import.
+RUN pip uninstall -y torchaudio torchcodec || true
+
 FROM ${CUDA_RUNTIME_IMAGE} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
+# gcc and the Python headers are not optional here, and the reason is the same one that makes
+# the note further down true: with FlashAttention compiled out at arch 6.1, vLLM falls back to
+# the Triton attention backend, and Triton builds its launcher stubs with a C compiler AT RUN
+# TIME. Without these, every model dies in profile_run with "Failed to find C compiler" -- so
+# `vllm serve` could not start at all, for any checkpoint. It was not caught earlier because
+# everything in pascal/MODELS.md was measured inside the build pod, which is the devel image
+# and carries a full toolchain.
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-      python3.12 python3.12-venv libgomp1 \
+      python3.12 python3.12-venv python3.12-dev libgomp1 gcc \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
