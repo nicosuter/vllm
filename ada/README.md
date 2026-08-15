@@ -148,16 +148,32 @@ Both are checkpoint changes and belong to whoever owns the quantization, not to
 this branch. What this branch owes them is the measurement rather than the
 arithmetic, and `probes/decode_profile.py` now supplies it.
 
-**A5 — Marlin at M=1 leaves ~25% of bandwidth on the table. Real, and small.**
-Both int4 kernels run at ~722 GB/s where cuBLAS's fp16 GEMV manages 958 on the
-same card. Lifting Marlin to ~90% of that would save about 0.4 ms of a 5.72 ms
-step — **roughly 7%**. That is the honest size of the "write a better batch-1
-W4A16 GEMV" idea here, an order of magnitude smaller than A1+A1b.
+**A5 — a better batch-1 W4A16 GEMV. CLOSED. The kernel is not the problem.**
+In the profile Marlin moves ~722 GB/s where cuBLAS's fp16 GEMV manages ~958, and
+that looked like a 25% per-byte deficit worth ~7% of a decode step. Measured
+directly with `probes/marlin_m_sweep.py`, on shapes large enough to actually be
+memory-bound:
 
-Before writing anything, sweep M over 1, 2, 4, 8 and 16 on these shapes. If time
-is flat across that range the kernel is bandwidth- or latency-bound and the gap
-is addressable; if it rises with M the tile is already doing real work and it is
-not. That sweep is cheap, needs no patch, and decides whether A5 exists.
+```
+marlin int4, M=1        cublas fp16, M=1
+  151 MB   856 GB/s       268 MB   855 GB/s
+  302 MB   865 GB/s       537 MB   952 GB/s
+  604 MB   872 GB/s
+```
+
+**Marlin reaches ~91% of what cuBLAS does on the same access pattern.** There is
+no per-byte headroom to recover, so writing a GEMV wins nothing. The in-model
+722 GB/s is a *launch granularity* effect — the model's launches read 10–13 MB
+each and carry a fixed per-launch cost — and that granularity is set by the model
+structure, not by the kernel. Nothing here to fix.
+
+Two measurement traps were walked into getting this number, both recorded in the
+probe so the next person does not repeat them. **L2 on a 4090 is 72 MiB, larger
+than any weight in Gemma4**, so benchmarking the model's own shapes measures
+cache: 26 MB of int4 "read" in 11.2 us is 2.3 TB/s, twice what the memory system
+can deliver. And synchronising once per iteration measures launch overhead rather
+than the kernel — it reported a flat ~18 us for a 1.1 MB weight and a 6.5 MB one
+alike, a 6x difference in bytes with no difference in time.
 
 Two things that idea should not be sold on, because both were checked and are
 false. MoE Marlin is a *grouped* GEMM — `marlin_moe_wna16/marlin_template.h`
@@ -231,13 +247,41 @@ while the sibling Qwen deployment runs MTP with three draft tokens. On a model
 this bandwidth-bound the drafting cost lands almost entirely in compute nobody is
 using, so the acceptance rate is close to a pure win.
 
-The obvious caveats before this becomes a change: Gemma4 ships no MTP head, so it
-needs either a draft model (which costs weights, and weights are the scarce
-resource here — see A1b) or an EAGLE-style head trained for it; and `ampere/`'s
-H2 is a warning that spec decode can silently cost more than it returns, since a
-one-layer draft head there removed full CUDA graphs from all 64 target layers.
-Gemma currently captures `FULL` graphs, and that must be re-checked, not assumed,
-after any spec-decode change.
+**Measured: through the quantized layers, rows 2 through 32 are free.** Same
+probe, one HBM-bound shape, sweeping M:
+
+```
+   M      us    GB/s   vs M=1
+   1   348.8     866    1.00x
+   2   348.9     866    1.00x
+   4   349.8     863    1.00x
+   8   329.5     917    0.94x
+  32   350.7     861    1.01x
+  64   449.5     672    1.29x
+```
+
+Flat to M=32, and slightly *faster* at M=8. A draft token costs nothing in the
+Marlin layers; only past M=32 does the tile start doing real work. So the whole
+cost of speculative decoding here is the proposer, and the acceptance rate is
+close to pure profit.
+
+**Why it is not already on: VRAM.** A draft model's weights come out of the KV
+budget, and concurrency is already only 1.43x — spending weights to buy draft
+tokens would trade away the thing that is scarce. That objection rules out a
+draft model and an EAGLE head, both of which need parameters.
+
+It does not rule out a proposer with no parameters at all. This build supports
+`method: "ngram"` and `"ngram_gpu"`, which propose by matching n-grams already in
+the context and cost **zero weights** — only a few extra token slots per step.
+On a deployment with a 51% prefix-cache hit rate the repetition an n-gram
+proposer feeds on is plausibly there. That is a flag-level change, so it is
+recorded here as a finding rather than applied.
+
+One caveat that must not be assumed away: `ampere/`'s H2 found that spec decode
+can silently cost more than it returns, because a one-layer draft head there
+removed full CUDA graphs from all 64 target layers. Gemma currently captures
+`FULL` graphs, and that has to be re-checked after any spec-decode change rather
+than taken on trust.
 
 ## Version skew: v0.27.1 is the wrong base for this model
 
