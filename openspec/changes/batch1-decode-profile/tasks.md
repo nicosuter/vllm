@@ -58,10 +58,27 @@ cap) in the production nightly `0.26.1rc1.dev602+g65b7662d3`.*
       per step is fp16 that could be int4.
 - [x] **lm_head is at the roofline** (958 GB/s vs 919 measured ceiling) — no
       kernel can help it.
-- [x] **A5 sized**: Marlin at M=1 runs ~722 GB/s (~78% of achievable); lifting
-      it to ~90% is worth ~7% of decode.
+- [x] **A5 sized, then closed.** The in-model 722 GB/s looked like a 25% per-byte
+      deficit. Measured directly past L2, Marlin reaches 856–872 GB/s against
+      cuBLAS fp16's 855–952 — **~91%**. No per-byte headroom; a batch-1 GEMV
+      wins nothing. The in-model figure is launch granularity (10–13 MB per
+      launch plus fixed cost), set by model structure.
+- [x] **Two benchmark traps recorded** in `marlin_m_sweep.py`: the 4090's 72 MiB
+      L2 exceeds every Gemma4 weight matrix, so the model's own shapes measure
+      cache (26 MB at an impossible 2.3 TB/s); and per-iteration synchronisation
+      measures launch overhead, reporting a flat ~18 µs for both a 1.1 MB and a
+      6.5 MB weight.
+- [x] **Rows 2–32 are free** through the quantized layers (M=8 is 0.94× of M=1;
+      only M=64 rises). A draft token costs nothing there, so the whole price of
+      spec decode is the proposer — and `ngram`/`ngram_gpu` cost zero weights,
+      which is the one form that survives the VRAM objection.
 
-## Measure — Qwen3.5-27B, 2x RTX 3090 Ti (sm_86)
+## Measure — Qwen3.5-27B, 2× RTX 3090 Ti (sm_86)
+
+**Blocked on permission for the Qwen stack.** `ampere/k8s/local/` is built and
+validated (2 GPUs, `w0.srv4.k1`, checkpoint mounted read-only, 40Gi scratch
+claim); Qwen has no reservation DaemonSet and its node has room for the 58Gi pod.
+The window needs the same appset → app → deployment peel.
 
 - [ ] Same two runs at TP=2 with MTP-3, matching the deployment.
 - [ ] Compare rank 0 and rank 1 occupancy. If they disagree sharply, the step is
@@ -69,11 +86,13 @@ cap) in the production nightly `0.26.1rc1.dev602+g65b7662d3`.*
       the cost of the step.
 - [ ] Re-measure sustained-load inter-token latency to replace the contaminated
       62.5 ms.
+- [ ] Re-check H2's 1.42x CUDA-graph result at sm_86 and 64 layers.
 - [ ] Restore and verify.
 
 ## Land
 
-- [ ] Replace the baseline sections of both READMEs with the measured tables,
-      keeping the falsified hypotheses on the record rather than deleting them.
-- [ ] Record the go/no-go on a batch-1 GEMV kernel, with the bandwidth-saturation
-      number that decides it.
+- [x] Replace `ada/README.md`'s baseline with the measured tables, keeping the
+      falsified hypotheses on the record rather than deleting them.
+- [x] Record the go/no-go on a batch-1 GEMV kernel with the number that decides
+      it: **no-go**, Marlin is at ~91% of cuBLAS.
+- [ ] Same for `ampere/README.md`, once the Qwen pair is measured.
