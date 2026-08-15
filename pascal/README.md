@@ -251,8 +251,19 @@ short-context compromise that an 8 GB card seems to imply. At 2.4 GB of INT4
 weights, the card has room to spare — including for the v2 vision tower.
 
 First startup is slow (many minutes) because Triton autotunes and compiles every
-kernel for sm_61. The cache lives on the PVC, so later starts skip it — but it is
-shape-specialized, so changing batch/sequence shapes pays part of it again.
+kernel for sm_61 — 250+ cubins, ~300 MB.
+
+Two things about that cache are worth knowing, both learned by measuring rather
+than assuming:
+
+- **It is not persistent by default.** Triton writes to `~/.triton`, which on a
+  container is the overlay filesystem and vanishes with the pod. `build-pod.yaml`
+  therefore sets `TRITON_CACHE_DIR=/work/.triton` so it lands on the PVC.
+- **It is shape-specialized, so a warm start is not a free start.** Re-running
+  the same command still compiles: changing sequence length, batch shape, or
+  enabling MTP produces new specializations. Measured: an identical repeat of
+  the gate run took **195 s** end to end (13.7 tok/s), against many minutes cold.
+  Faster, not instant.
 
 ### Kernel correctness
 

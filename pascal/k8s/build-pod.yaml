@@ -40,6 +40,13 @@ spec:
           value: "6.1"
         - name: CCACHE_DIR
           value: /work/.ccache
+        # Triton defaults to ~/.triton, which on a container is the overlay
+        # filesystem and dies with the pod. That matters more here than on
+        # supported hardware: first startup compiles and autotunes every kernel
+        # for sm_61 and takes many minutes, so losing the cache on a pod restart
+        # means paying all of it again.
+        - name: TRITON_CACHE_DIR
+          value: /work/.triton
         - name: CMAKE_BUILD_PARALLEL_LEVEL
           value: "8"
         # nvcc peaks around 2 GB per translation unit; 8 jobs against the
