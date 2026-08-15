@@ -28,8 +28,24 @@ PROMPTS = [
 ]
 
 
-def run_vllm(model: str, max_tokens: int, enforce_eager: bool, gpu_frac: float):
+def run_vllm(
+    model: str,
+    max_tokens: int,
+    enforce_eager: bool,
+    gpu_frac: float,
+    mtp_tokens: int = 0,
+):
     from vllm import LLM, SamplingParams
+
+    kwargs = {}
+    if mtp_tokens:
+        # Qwen3.5 carries a real MTP head (mtp_num_hidden_layers=1), and this
+        # checkpoint keeps it quantized rather than stripping it. vLLM builds the
+        # draft model from the same weights, so no second checkpoint is needed.
+        kwargs["speculative_config"] = {
+            "method": "mtp",
+            "num_speculative_tokens": mtp_tokens,
+        }
 
     llm = LLM(
         model=model,
@@ -38,6 +54,7 @@ def run_vllm(model: str, max_tokens: int, enforce_eager: bool, gpu_frac: float):
         gpu_memory_utilization=gpu_frac,
         max_model_len=2048,
         trust_remote_code=True,
+        **kwargs,
     )
     # Greedy, so the comparison against the reference is deterministic.
     params = SamplingParams(temperature=0.0, max_tokens=max_tokens, logprobs=5)
@@ -103,10 +120,19 @@ def main() -> int:
     ap.add_argument("--gpu-frac", type=float, default=0.85)
     ap.add_argument("--no-eager", action="store_true", help="allow CUDA graphs / torch.compile")
     ap.add_argument("--skip-reference", action="store_true", help="generation only, no CPU reference")
+    ap.add_argument(
+        "--mtp",
+        type=int,
+        default=0,
+        metavar="N",
+        help="enable MTP speculative decoding with N speculative tokens",
+    )
     ap.add_argument("--out", default="/work/gate_result.json")
     args = ap.parse_args()
 
-    results = run_vllm(args.model, args.max_tokens, not args.no_eager, args.gpu_frac)
+    results = run_vllm(
+        args.model, args.max_tokens, not args.no_eager, args.gpu_frac, args.mtp
+    )
 
     print("\n" + "=" * 72)
     print("GENERATION")
