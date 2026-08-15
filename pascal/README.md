@@ -177,13 +177,32 @@ Environment gotchas, all encoded in `setup-build-env.sh`:
 
 ### How the quantized path resolves on Pascal
 
-The gate model is compressed-tensors W4A16, asymmetric, group size 128. Marlin
-is sm_75+, Machete sm_90, CUTLASS W4A8 sm_90 — none available. But
-`TritonW4A16LinearKernel` reports `get_min_capability() == 0` ("Triton handles
-capability checks itself") and accepts `scalar_types.uint4` (asymmetric with
-explicit zeros) at group sizes `[-1, 32, 64, 128, 256]`. So the checkpoint's
-exact quantization lands on a Triton kernel that we have measured working on
-this card.
+The gate model is compressed-tensors W4A16 `pack-quantized`, **symmetric, group
+size 32** (from the checkpoint's own `quantization_config`). Marlin is sm_75+,
+Machete sm_90, CUTLASS W4A8 sm_90 — none available.
+
+What it actually lands on is **`ExllamaLinearKernel`**, which the engine reports
+at startup:
+
+```
+[compressed_tensors_wNa16.py:146] Using ExllamaLinearKernel for CompressedTensorsWNA16
+```
+
+That is a hand-written CUDA kernel declaring `get_min_capability() == 60`, i.e.
+Pascal-era by construction. Symmetric int4 is `scalar_types.uint4b8`, which is
+in its `SUPPORTED_QUANT_TYPES`, and it requires fp16 activations, which is what
+this fork forces anyway.
+
+> An earlier revision of this file claimed the path resolved to
+> `TritonW4A16LinearKernel` at group size 128, asymmetric. All three details
+> were wrong. That kernel's docstring describes it as "Triton-based W4A16 GEMM
+> kernel for ROCm MI300"; it is never selected here. The distinction matters
+> because it moves the hot loop from Triton to nvcc-compiled CUDA, which is what
+> made the fp16-rate problem below findable at all.
+
+Attention resolves differently, and does go through Triton:
+`TritonAttentionBackend.supports_compute_capability` returns `True`
+unconditionally, and `gdn_attn` handles the 18 Gated DeltaNet layers.
 
 Attention resolves the same way: `TritonAttentionBackend.supports_compute_capability`
 returns `True` unconditionally, and `gdn_attn` handles the 18 Gated DeltaNet
