@@ -37,13 +37,12 @@ spec decode with `num_speculative_tokens=3`, `kv_cache_dtype=fp8`:
 | KV cache | fp8, 7.2 GiB, 405,664 tokens, 1.55x concurrency at 262k context |
 | External prefix cache | 36,364 queries, **0 hits** |
 
-**Treat the 62.5 ms as unproven.** It comes from 230 samples, all of them
-four-token health-check generations against an otherwise idle engine. A card in
-P8 runs at 210 MHz against a 2100 MHz ceiling; a short request that never
-triggers a clock ramp would produce roughly this number all on its own. Ruling
-that out is the first job of the harness here, because a 10x clock deficit and
-a 10x kernel problem look identical from the outside, and only one of them is
-worth writing code for.
+**Treat the 62.5 ms as weak evidence.** It comes from 230 samples, all of them
+four-token health-check generations against an otherwise idle engine — short
+enough that per-request fixed costs dominate whatever the steady-state decode
+rate actually is. The obvious explanation, that the cards were asleep, has been
+measured and ruled out (H1). It still needs replacing with a number taken under
+sustained load on the pair before any kernel work is justified by it.
 
 For reference, the bandwidth roofline for a batch-1 decode step: ~8.8 GB read
 per target forward per GPU (backbone at 4 bits plus a TP-sharded 248320×5120
@@ -54,7 +53,8 @@ to find out which.
 
 ## Hypotheses, ranked
 
-Each is falsifiable and none has been tested yet.
+Status after the first round: **H1 false, H2 measured, H4 confirmed, H3 blocked
+on hardware.**
 
 **H1 — Idle clocks. CLOSED, false.** Measured with `probes/clock_ramp.py` on an
 idle RTX 4090 (see "Where these were measured"), 8192³ bf16 matmul after 25 s of
@@ -259,6 +259,16 @@ a known confounder (H1) that costs nothing to eliminate.
 Order of work: H1 (exclude the confounder) → re-measure the baseline under
 sustained load with locked clocks → profile by kernel → then, and only then,
 pick between H2, H3 and H4 on the evidence.
+
+The first round followed it and the order paid twice. H1 was false, which would
+have made a kernel investigation chase a 15x that was never there. And H2's
+easiest-looking fix — force the backend the warning names — turned out not to
+work, which only measurement showed; reasoning from the warning text alone would
+have produced a patch that changed nothing.
+
+What is left: re-measure the baseline on the pair under sustained load, run H3's
+all-reduce probe, and re-confirm H2's 1.42x at sm_86 and 64 layers before it
+becomes a deployment change.
 
 ## Layout
 
