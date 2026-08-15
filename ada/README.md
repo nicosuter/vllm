@@ -94,12 +94,59 @@ GEMMs per token, each 2816×704 — small enough that launch and tail effects ma
 dominate. Only worth opening if `decode_profile.py` shows the Marlin bucket
 large relative to its bandwidth share. Deep work; last in line.
 
-## Version skew
+## Version skew: v0.27.1 is the wrong base for this model
 
-Production runs a nightly (`0.26.1rc1.dev602+g65b7662d3`); this branch is based
-on `v0.27.1`. `Gemma4Config` carries the same forcing logic in both, differing
-only in how it reads the head dimensions, so A2 transfers. Anything else found
-here should be re-checked against the nightly before it reaches the deployment.
+This branch was based on upstream's latest *release*, which is the right default
+and happens to be wrong here. Three findings, all from file content and a
+measured failure rather than from commit ancestry (the local clone is shallow,
+so `merge-base` cannot be trusted and was not used):
+
+**1. The stock `v0.27.1` release image cannot load this checkpoint.** It ships
+`transformers 5.15.0`, whose heterogeneity integration raises on per-layer
+attributes:
+
+```
+AmbiguousGlobalPerLayerAttributeError: 'head_dim' is a per-layer attribute and
+may vary across layers. Access it via the individual layer configs instead
+```
+
+v0.27.1's `model_arch_config_convertor.get_head_size()` does a bare
+`getattr(self.hf_text_config, "head_dim", 0)`, and `requirements/common.txt`
+pins only `transformers >= 5.5.3`, so the release image installs a transformers
+that its own code cannot survive on a heterogeneous model.
+
+**2. Pinning `transformers==5.8.1` fixes it** — the same pin the `pascal` branch
+arrived at independently from the same v0.27.1 base. The model then loads (15.55
+GiB, `MarlinExperts`) and everything here runs.
+
+**3. Production is running different code in exactly the function A2 patches.**
+`Gemma4Config` on v0.27.1 reads two scalars off the text config:
+
+```python
+head_dim = getattr(hf_text_config, "head_dim", None)
+global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+```
+
+while upstream `main` reads them per layer, which is why it is immune to (1):
+
+```python
+head_dims = {layer_types[i]: arch_config[i].head_size ...}
+```
+
+The deployment logs `heterogeneous head dimensions {'sliding_attention': 256,
+'full_attention': 512}` — a dict, matching `main`'s message and not v0.27.1's
+`(head_dim=%d, global_head_dim=%d)`. So production runs the per-layer version.
+
+**Consequence.** Measurements here are made on a transformers pin production
+does not use, against a `Gemma4Config` production does not run. The A2 result
+should still transfer, because the forcing *behaviour* is identical in both
+versions — both end at `attention_config.backend = TRITON_ATTN` — but the patch
+itself must be written against whatever base the deployment actually ships, and
+that is not this one. Before A2 becomes a deployment change, rebase `ada/` onto
+the nightly the Gemma pod runs (`65b7662d3`) or onto `main`.
+
+`ampere/` is unaffected: Qwen3.5 does not have heterogeneous head dimensions, and
+that deployment genuinely runs `v0.27.1`.
 
 ## Running the probes
 
