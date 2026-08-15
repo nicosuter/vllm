@@ -15,7 +15,7 @@ from pathlib import Path
 from shutil import which
 
 import torch
-from packaging.version import Version, parse
+from packaging.version import InvalidVersion, Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools_rust.build import build_rust
@@ -1129,7 +1129,32 @@ if not _is_xpu() and sys.version_info >= (3, 11):
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
-if _is_cuda():
+def _targets_tensor_core_arch() -> bool:
+    """True if any requested CUDA arch has tensor cores (>= 8.0).
+
+    FlashAttention is sm_80+ (FA2) and sm_90+ (FA3), so on a Pascal-only build
+    CMake skips the subproject entirely. setup.py has to agree, or it asks
+    cmake --build for targets that were never defined and the build dies with
+    "unknown target '_vllm_fa2_C'".
+    """
+    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
+    if not arch_list:
+        # Unset means "build for everything torch supports", which includes
+        # tensor-core arches, so keep upstream's behaviour.
+        return True
+    for arch in re.split(r"[;\s]+", arch_list):
+        arch = arch.split("+")[0].strip().rstrip("af")
+        if not arch:
+            continue
+        try:
+            if Version(arch) >= Version("8.0"):
+                return True
+        except InvalidVersion:
+            continue
+    return False
+
+
+if _is_cuda() and _targets_tensor_core_arch():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if USE_PRECOMPILED_EXTENSIONS or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
@@ -1141,6 +1166,8 @@ if _is_cuda():
     ext_modules.append(
         CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
     )
+
+if _is_cuda():
     if USE_PRECOMPILED_EXTENSIONS or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
     ):
