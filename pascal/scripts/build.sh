@@ -47,6 +47,17 @@ echo "==> import check"
 cd "$SRC"
 python - <<'PY'
 import torch  # noqa: F401  (must precede the extension import)
-import vllm._C  # noqa: F401
-print("vllm._C imported")
+
+# The CUDA kernels live in _C_stable_libtorch, not _C: vLLM moved them to the
+# libtorch-stable ABI. Probing the old name made a successful build report
+# failure, which is worse than not checking at all.
+import vllm._C_stable_libtorch  # noqa: F401
+import vllm._moe_C_stable_libtorch  # noqa: F401
+
+# Cheap proof the quantized path is actually wired up, since that is the only
+# GEMM this fork can use for W4A16.
+from vllm import _custom_ops as ops
+
+assert hasattr(ops, "gptq_gemm"), "gptq_gemm missing from _custom_ops"
+print("extensions imported; gptq_gemm present")
 PY
