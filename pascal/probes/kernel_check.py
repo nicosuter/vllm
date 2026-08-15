@@ -67,9 +67,8 @@ print("=" * 72, flush=True)
 print(f"device {torch.cuda.get_device_name()} sm_{''.join(map(str, torch.cuda.get_device_capability()))}", flush=True)
 
 
-@check("w4a16.exllama_vs_fp32_dequant")
-def _w4a16_exllama():
-    """Pack a known weight to int4, run the exllama kernel, compare to fp32 math.
+def _exllama_case(M: int):
+    """Pack a known weight to int4, run the exllama path, compare to fp32 math.
 
     This is the kernel the gate model's every linear layer actually goes
     through -- the engine logs "Using ExllamaLinearKernel for
@@ -77,11 +76,18 @@ def _w4a16_exllama():
     get_min_capability() == 60 while Marlin (sm_75+), Machete (sm_90) and
     CUTLASS W4A8 (sm_90) all opt out.
 
-    It is also the kernel this fork modified: dot22_8_f now accumulates in fp32
-    on sm_61 rather than in half2, so this check is what stands behind the claim
-    that the rewrite did not change the mathematics. The HF fp32 reference that
-    would otherwise verify it is unavailable for the reason given at the top of
-    this file, which makes this check load-bearing rather than incidental.
+    M selects which implementation runs, and the two are entirely different
+    code, which is why both are checked:
+
+      M <= MAX_Q_GEMM_ROWS (50)   the fused dequant+GEMM kernel, whose
+                                  dot22_8_f and dequant this fork moved to fp32
+      M >  MAX_Q_GEMM_ROWS        reconstruct the fp16 weight matrix, then
+                                  cuBLAS -- which this fork switched from
+                                  cublasHgemm to cublasGemmEx/CUBLAS_COMPUTE_32F
+
+    The HF fp32 reference that would otherwise verify either is unavailable for
+    the reason given at the top of this file, which makes these checks
+    load-bearing rather than incidental.
     """
     try:
         from vllm import _custom_ops as ops
@@ -92,7 +98,7 @@ def _w4a16_exllama():
 
     torch.manual_seed(0)
     # The checkpoint's own quantization_config: symmetric int4, group_size 32.
-    M, K, N, group = 8, 2048, 512, 32
+    K, N, group = 2048, 512, 32
     n_groups = K // group
 
     qweight = torch.randint(0, 16, (K, N), device="cuda", dtype=torch.int32)
@@ -132,6 +138,22 @@ def _w4a16_exllama():
             f"exllama W4A16 disagrees with fp32 dequant reference: rel_err={err:.3e}"
         )
     return f"rel_err={err:.3e} (M={M} K={K} N={N} group={group})"
+
+
+@check("w4a16.exllama_decode_vs_fp32_dequant")
+def _w4a16_exllama_decode():
+    """M=8: the fused kernel, with this fork's fp32 dot and fp32 dequant."""
+    return _exllama_case(8)
+
+
+@check("w4a16.exllama_prefill_vs_fp32_dequant")
+def _w4a16_exllama_prefill():
+    """M=128: past MAX_Q_GEMM_ROWS, so reconstruct + cublasGemmEx instead.
+
+    Separate from the M=8 case because it shares no code with it. Without this,
+    the switch from cublasHgemm to CUBLAS_COMPUTE_32F would be unverified.
+    """
+    return _exllama_case(128)
 
 
 @check("w4a16.triton_vs_fp32_dequant")

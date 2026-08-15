@@ -1598,10 +1598,38 @@ void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
                        temp_dq, size_k, size_n, groups, use_v2_format, bit);
     }
 
+#if defined(USE_ROCM)
     const half alpha = __float2half(1.0f);
     const half beta = __float2half(0.0f);
     cublasHgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, size_n, size_m, size_k,
                 &alpha, temp_dq, size_n, a, size_k, &beta, c, size_n);
+#else
+    // cublasHgemm requests half *compute*, not merely half storage, and cuBLAS
+    // honours that on Pascal -- where it lands on the same 1/56-rate FP16x2
+    // unit that made the decode kernel slow. Measured by
+    // pascal/probes/cublas_hgemm_rate.cu on a GTX 1070 Ti:
+    //
+    //     shape              Hgemm     GemmEx    speedup
+    //     batch64  qkv/o     5.320 ms  0.119 ms   44.8x
+    //     prefill512 mlp   100.503 ms  1.868 ms   53.8x
+    //     prefill2048 mlp  383.030 ms  8.126 ms   47.1x
+    //
+    // This is the only GEMM prefill uses: above MAX_Q_GEMM_ROWS the exllama
+    // path reconstructs an fp16 weight matrix and hands it to cuBLAS, so none
+    // of the fused kernel's fp32 work applies here.
+    //
+    // CUBLAS_COMPUTE_32F keeps fp16 inputs and outputs and accumulates in fp32,
+    // so this is a drop-in that is also strictly more accurate. It is not
+    // guarded to sm_61: on every architecture from Volta on, fp16-in/fp32-accum
+    // is the tensor-core path and the one every other GEMM in vLLM already
+    // asks for, so there is no configuration this makes worse.
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, size_n, size_m,
+                 size_k, &alpha, temp_dq, CUDA_R_16F, size_n, a, CUDA_R_16F,
+                 size_k, &beta, c, CUDA_R_16F, size_n, CUBLAS_COMPUTE_32F,
+                 CUBLAS_GEMM_DEFAULT);
+#endif
   } else if (use_exllama) {
     // Quantized matmul
     int max_chunks = size_m / BLOCK_M_SIZE_MAX;
