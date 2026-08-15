@@ -246,22 +246,10 @@ def _bincount_kernel(
         idx = prompt_tokens // 32
         bit_idx = prompt_tokens % 32
         bit = tl.full((BLOCK_SIZE,), 1, tl.int32) << bit_idx
-        # sem="relaxed" because Triton's default is "acq_rel", which emits PTX
-        # the assembler rejects below sm_70: "Feature '.acq_rel' requires
-        # .target sm_70 or higher". Acquire-release ordering only entered the
-        # PTX memory model at Volta.
-        #
-        # Relaxed is the correct ordering here regardless of hardware: this
-        # ORs independent bits into a mask, so the result depends on atomicity
-        # alone and not on ordering against other memory operations, and the
-        # kernel boundary supplies the visibility the host relies on. vLLM
-        # already uses sem="relaxed" for the same reason in the fused MoE LoRA
-        # kernels.
         tl.atomic_or(
             prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + idx,
             bit,
             mask=mask,
-            sem="relaxed",
         )
 
     if (block_idx + 1) * BLOCK_SIZE >= prompt_len:
@@ -270,16 +258,78 @@ def _bincount_kernel(
         output_tokens = tl.load(
             all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask
         )
-        # Relaxed for the same reason as the atomic_or above: counting into
-        # bins needs atomicity, not ordering.
         tl.atomic_add(
             output_bin_counts_ptr
             + req_state_idx * output_bin_counts_stride
             + output_tokens,
             1,
             mask=mask,
-            sem="relaxed",
         )
+
+
+def _bincount_torch(
+    expanded_idx_mapping: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    prompt_len: torch.Tensor,
+    prefill_len: torch.Tensor,
+    prompt_bin_mask: torch.Tensor,
+    output_bin_counts: torch.Tensor,
+    max_prefill_len: int,
+) -> None:
+    """Pure-PyTorch equivalent of _bincount_kernel, for pre-sm_70 devices.
+
+    Triton cannot express an atomic that Pascal can assemble. Its atomics always
+    emit the PTX memory-model syntax introduced at Volta, so ptxas rejects them
+    with "Feature '.acq_rel' requires .target sm_70 or higher" — and choosing
+    sem="relaxed" only changes which qualifier is rejected, because the whole
+    `atom.<sem>.<scope>` form is sm_70+. Pascal has only the legacy unqualified
+    atomics, which Triton has no way to request.
+
+    torch's scatter_add_ has the same problem in reverse: it is compiled by nvcc
+    rather than Triton, so it uses the legacy atomics and works here. Rather
+    than accumulate at all, this builds each row's result independently and
+    writes it back, which sidesteps the race the Triton kernel needed atomics
+    for.
+
+    Masked-out positions are scattered into a sentinel column past the vocab
+    rather than into index 0, so they cannot clobber a genuine entry for token
+    0 — scatter has no defined order among duplicate indices.
+    """
+    rows = expanded_idx_mapping.long()
+    num_rows = rows.shape[0]
+    vocab_size = output_bin_counts.shape[1]
+    device = all_token_ids.device
+
+    tokens = all_token_ids.index_select(0, rows)[:, :max_prefill_len].long()
+    positions = torch.arange(tokens.shape[1], device=device).unsqueeze(0)
+    plen = prompt_len.index_select(0, rows).long().unsqueeze(1)
+    flen = prefill_len.index_select(0, rows).long().unsqueeze(1)
+
+    sentinel = torch.full_like(tokens, vocab_size)
+
+    # Output region [prompt_len, prefill_len): count occurrences per token.
+    out_mask = (positions >= plen) & (positions < flen)
+    out_idx = torch.where(out_mask, tokens, sentinel)
+    counts = torch.zeros(num_rows, vocab_size + 1, dtype=torch.int32, device=device)
+    counts.scatter_add_(1, out_idx, torch.ones_like(out_idx, dtype=torch.int32))
+    output_bin_counts.index_copy_(0, rows, counts[:, :vocab_size])
+
+    # Prompt region [0, prompt_len): presence bitmask, 32 tokens per int32 word.
+    prompt_mask = positions < plen
+    prompt_idx = torch.where(prompt_mask, tokens, sentinel)
+    presence = torch.zeros(num_rows, vocab_size + 1, dtype=torch.bool, device=device)
+    presence.scatter_(1, prompt_idx, True)
+    presence = presence[:, :vocab_size]
+
+    num_words = prompt_bin_mask.shape[1]
+    padding = num_words * 32 - vocab_size
+    if padding:
+        presence = torch.nn.functional.pad(presence, (0, padding))
+    bit_weights = torch.arange(32, device=device, dtype=torch.int32)
+    words = (presence.view(num_rows, num_words, 32).to(torch.int32) << bit_weights).sum(
+        dim=2, dtype=torch.int32
+    )
+    prompt_bin_mask.index_copy_(0, rows, words)
 
 
 def bincount(
@@ -291,6 +341,22 @@ def bincount(
     output_bin_counts: torch.Tensor,
     max_prefill_len: int,
 ) -> None:
+    from vllm.platforms import current_platform
+
+    if not current_platform.has_device_capability(70):
+        # See _bincount_torch: Triton's atomics cannot be assembled for sm_61,
+        # so this is a substitution rather than a preference.
+        _bincount_torch(
+            expanded_idx_mapping,
+            all_token_ids,
+            prompt_len,
+            prefill_len,
+            prompt_bin_mask,
+            output_bin_counts,
+            max_prefill_len,
+        )
+        return
+
     # Use index_fill_ instead of `tensor[idx] = 0` to avoid sync.
     idx_long = expanded_idx_mapping.long()
     prompt_bin_mask.index_fill_(0, idx_long, 0)
