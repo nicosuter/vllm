@@ -34,10 +34,20 @@ def run_vllm(
     enforce_eager: bool,
     gpu_frac: float,
     mtp_tokens: int = 0,
+    text_only: bool = True,
 ):
     from vllm import LLM, SamplingParams
 
     kwargs = {}
+    if text_only:
+        # Qwen3.5-2B is multimodal, so vLLM profiles the vision tower with a
+        # max-size image even when no image is ever sent. On Pascal that
+        # encoder runs its rotary embedding unfused (flash-attention's fused
+        # apply_rotary_emb needs the FA extension), which makes startup
+        # profiling far more expensive than the text path it is sizing.
+        # v1 is text-only, so decline the modalities outright.
+        kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+
     if mtp_tokens:
         # Qwen3.5 carries a real MTP head (mtp_num_hidden_layers=1), and this
         # checkpoint keeps it quantized rather than stripping it. vLLM builds the
@@ -127,11 +137,22 @@ def main() -> int:
         metavar="N",
         help="enable MTP speculative decoding with N speculative tokens",
     )
+    ap.add_argument(
+        "--multimodal",
+        action="store_true",
+        help="allow image/video inputs (v2); off by default so startup does not "
+        "profile the vision tower",
+    )
     ap.add_argument("--out", default="/work/gate_result.json")
     args = ap.parse_args()
 
     results = run_vllm(
-        args.model, args.max_tokens, not args.no_eager, args.gpu_frac, args.mtp
+        args.model,
+        args.max_tokens,
+        not args.no_eager,
+        args.gpu_frac,
+        args.mtp,
+        not args.multimodal,
     )
 
     print("\n" + "=" * 72)

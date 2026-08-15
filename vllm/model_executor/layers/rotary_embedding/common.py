@@ -232,7 +232,16 @@ class ApplyRotaryEmb(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        try:
+            from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        except ImportError:
+            # This rope is only reachable through the multimodal encoders, and
+            # its sole CUDA-specific ingredient is flash-attention's fused
+            # apply_rotary_emb. A Pascal build has no FA extension, but
+            # forward_native computes exactly the same thing in PyTorch, so
+            # deferring to it keeps the vision tower working (just unfused)
+            # rather than making the encoder unusable.
+            return self.forward_native(x, cos, sin)
 
         x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 

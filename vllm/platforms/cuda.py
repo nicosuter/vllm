@@ -1013,4 +1013,25 @@ finally:
 
 CudaPlatform = NvmlCudaPlatform if nvml_available else NonNvmlCudaPlatform
 
+# Hand-written Triton kernels run fine on Pascal — vLLM compiles and executes
+# hundreds of them here. torch.compile is the part that does not: inductor
+# applies its own stricter floor and raises GPUTooOldForTriton for anything
+# below sm_70, regardless of what Triton itself supports.
+#
+# Fourteen sites across vLLM read simple_compile_backend to decorate helpers
+# with @torch.compile at import time, so the substitution has to happen here
+# rather than at any one of them. enforce_eager does not cover these: it turns
+# off compilation of the model, not of standalone utilities like
+# batched_count_greater_than, which otherwise kills the engine mid-generation.
+#
+# Capability comes from NVML on the usual path, so this does not initialize
+# CUDA just to answer the question.
+try:
+    _compile_capability = CudaPlatform.get_device_capability()
+except Exception:  # noqa: BLE001 - no device, or NVML unavailable
+    _compile_capability = None
+
+if _compile_capability is not None and _compile_capability.to_int() < 70:
+    CudaPlatform.simple_compile_backend = "eager"
+
 CudaPlatform.log_warnings()
