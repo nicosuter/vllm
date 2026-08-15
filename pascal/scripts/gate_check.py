@@ -92,8 +92,11 @@ def run_reference(model: str, results: list[dict], max_tokens: int):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model)
+    # No device_map: it would pull in accelerate, and transformers already loads
+    # onto CPU by default. fp32 is the point of the comparison — it is the
+    # arithmetic the Pascal kernels are being checked against.
     ref_model = AutoModelForCausalLM.from_pretrained(
-        model, dtype=torch.float32, device_map="cpu", trust_remote_code=True
+        model, dtype=torch.float32, trust_remote_code=True
     )
     ref_model.eval()
 
@@ -143,23 +146,42 @@ def main() -> int:
         help="allow image/video inputs (v2); off by default so startup does not "
         "profile the vision tower",
     )
+    ap.add_argument(
+        "--from-json",
+        metavar="PATH",
+        help="skip the vLLM run and compare a previous run's saved output; "
+        "avoids paying Triton's first-run compile again just to redo the "
+        "reference",
+    )
     ap.add_argument("--out", default="/work/gate_result.json")
     args = ap.parse_args()
 
-    results = run_vllm(
-        args.model,
-        args.max_tokens,
-        not args.no_eager,
-        args.gpu_frac,
-        args.mtp,
-        not args.multimodal,
-    )
+    if args.from_json:
+        with open(args.from_json) as fh:
+            results = json.load(fh)
+        print(f"loaded {len(results)} prior results from {args.from_json}")
+    else:
+        results = run_vllm(
+            args.model,
+            args.max_tokens,
+            not args.no_eager,
+            args.gpu_frac,
+            args.mtp,
+            not args.multimodal,
+        )
 
     print("\n" + "=" * 72)
     print("GENERATION")
     print("=" * 72)
     for r in results:
         print(f"\n>>> {r['prompt']!r}\n    {r['text']!r}")
+
+    # Persist before the reference step. The reference loads a second copy of
+    # the model in fp32 and is the most likely thing to fail; losing an
+    # expensive vLLM run to that would be daft.
+    with open(args.out, "w") as fh:
+        json.dump(results, fh, indent=1)
+    print(f"\nwrote {args.out}")
 
     if not args.skip_reference:
         print("\nrunning CPU fp32 reference (slow)...", flush=True)
@@ -176,9 +198,8 @@ def main() -> int:
                 print(f"      pascal: {r['text']!r}")
                 print(f"      ref   : {r['ref_text']!r}")
 
-    with open(args.out, "w") as fh:
-        json.dump(results, fh, indent=1)
-    print(f"\nwrote {args.out}")
+        with open(args.out, "w") as fh:
+            json.dump(results, fh, indent=1)
 
     if not args.skip_reference:
         worst = min(r["prefix_match_frac"] for r in results)
