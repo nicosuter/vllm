@@ -69,18 +69,45 @@ stop.
 | attention | `kernel_unified_attention` | 0.149 ms | | |
 | **total** | | **5.72 ms** | **~3.97 GB** | **694 GB/s** |
 
-The card's practical ceiling, measured on the same pod, is **919 GB/s** on a
-large device-to-device copy — 91% of the 1008 GB/s spec. Percentages below are
-against that, not against the spec sheet.
+**What to measure achieved bandwidth against.** A device-to-device copy on this
+pod runs at 919 GB/s, but a copy is read+write and every kernel above is nearly
+pure read, so copy understates the ceiling for them — which is why lm_head
+appears to beat it. The honest reference is lm_head itself: cuBLAS's fp16 GEMV,
+on exactly this access pattern, at **958 GB/s**. Percentages below are against
+that.
+
+| kernel | GB/s | % of 958 |
+|---|---|---|
+| lm_head (fp16) | 958 | **100% — the reference** |
+| dense MLP gate+up (fp16) | 860 | 90% |
+| dense MLP down (fp16) | 802 | 84% |
+| MoE experts (**int4**) | 722 | **75%** |
+| attention proj (**int4**) | 721 | **75%** |
+
+The split is by dtype, not by layer. Every fp16 kernel reaches 84–100% of what a
+good GEMV does on this card; both int4 Marlin kernels sit at 75%. **lm_head is at
+the roofline and no kernel can improve it** — only reading fewer bytes can. Why
+Marlin loses the other 25% is *not* measured: dequantisation ALU, scale traffic,
+layout shuffles and low occupancy at M=1 are all candidates and picking between
+them needs a microbenchmark that sweeps M.
 
 So the real roofline is ~3.97 GB/step → **232 tok/s**, and 175 measured is **75%
 of achievable bandwidth**, not the 34% the old estimate implied. The headroom is
 1.3x, not 2.5x, and it is not where the estimate said it was.
 
-Two rows deserve attention. **lm_head is at the roofline** — 958 GB/s against a
-919 GB/s measured copy ceiling means no kernel can improve it; only reading fewer
-bytes can. And the *quantized* kernels are the slow ones: Marlin sits at ~722
-GB/s, about 78% of achievable, while the unquantized cuBLAS GEMVs reach 87–100%.
+**16.5% of the step reads no weights.** The five kernels above account for 4.793
+ms of the 5.741 ms step. The remaining 0.948 ms is routing (0.228), attention
+(0.149), norms, elementwise and memcpy, spread over 674 launches per step. Byte
+accounting misses it entirely, and it is the same size as the whole Marlin gap.
+
+**Compute is ~1% utilised.** About 4.7B active parameters per token (4B backbone
+plus the 738M vocab projection) is ~9.4 GFLOP, and 9.4 GFLOP in 5.72 ms is 1.6
+TFLOPS against roughly 165 TFLOPS of fp16 tensor-core peak. Charging Marlin for
+all eight rows of its `m_block_size_8` tile still leaves it under 8%. Two things
+follow. Any kernel that spends arithmetic to save bandwidth is free here, so if
+Marlin's 25% gap is dequantisation cost it is recoverable. And the classic way to
+convert idle FLOPs into tokens is speculative decoding, which this deployment
+does not run — see A6.
 
 The attention-projection byte count is derived from config shapes (heterogeneous
 head dims, `attention_k_eq_v`, `v_proj` present in only 25 of 30 layers) and is
@@ -121,12 +148,16 @@ Both are checkpoint changes and belong to whoever owns the quantization, not to
 this branch. What this branch owes them is the measurement rather than the
 arithmetic, and `probes/decode_profile.py` now supplies it.
 
-**A5 — Marlin at M=1 leaves ~22% of bandwidth on the table. Real, and small.**
-The quantized kernels run at ~722 GB/s where the unquantized cuBLAS GEMVs reach
-802–958 and the card copies at 919. Lifting Marlin to ~90% of achievable would
-save about 0.4 ms of a 5.72 ms step — **roughly 7%**. That is the honest size of
-the "write a better batch-1 W4A16 GEMV" idea on this model, and it is an order of
-magnitude smaller than A1+A1b.
+**A5 — Marlin at M=1 leaves ~25% of bandwidth on the table. Real, and small.**
+Both int4 kernels run at ~722 GB/s where cuBLAS's fp16 GEMV manages 958 on the
+same card. Lifting Marlin to ~90% of that would save about 0.4 ms of a 5.72 ms
+step — **roughly 7%**. That is the honest size of the "write a better batch-1
+W4A16 GEMV" idea here, an order of magnitude smaller than A1+A1b.
+
+Before writing anything, sweep M over 1, 2, 4, 8 and 16 on these shapes. If time
+is flat across that range the kernel is bandwidth- or latency-bound and the gap
+is addressable; if it rises with M the tile is already doing real work and it is
+not. That sweep is cheap, needs no patch, and decides whether A5 exists.
 
 Two things that idea should not be sold on, because both were checked and are
 false. MoE Marlin is a *grouped* GEMM — `marlin_moe_wna16/marlin_template.h`
@@ -180,10 +211,33 @@ budget against the 4.55 GiB actually taken: **+18% KV for free** at unchanged
 `--gpu-memory-utilization`. Configuration, not a patch; reported here because
 KV is the binding constraint on concurrency.
 
-**A4 — Marlin MoE at batch 1.** 128 experts, top-8, 30 layers means 240 expert
-GEMMs per token, each 2816×704 — small enough that launch and tail effects may
-dominate. Only worth opening if `decode_profile.py` shows the Marlin bucket
-large relative to its bandwidth share. Deep work; last in line.
+**A4 — Marlin MoE at batch 1. CLOSED, the premise was false.** This said 240
+expert GEMMs per token, small enough that launch and tail effects might dominate.
+There are about 60. MoE Marlin is a grouped GEMM: `marlin_moe_wna16` reads
+`expert_id` per block, so `marlin_moe.py` issues one launch for `w1` and one for
+`w2` per layer regardless of top-k. There is no per-expert launch overhead, and
+the measured occupancy leaves no room for a launch problem of any kind. What
+remains of this hypothesis is A5, which is about bandwidth rather than launches.
+
+**A6 — Nothing is using the compute, and there is no speculative decoding. NEW,
+and probably the largest engine-level item here.** Decode runs at roughly 1% of
+the card's fp16 tensor-core throughput (~1.6 TFLOPS of ~165), because batch-1
+decode reads ~3.97 GB to do ~9.4 GFLOP. The arithmetic units are idle for
+essentially the whole step.
+
+Speculative decoding is the standard way to spend idle FLOPs on tokens, and this
+deployment does not run it — there is no `--speculative-config` in its args,
+while the sibling Qwen deployment runs MTP with three draft tokens. On a model
+this bandwidth-bound the drafting cost lands almost entirely in compute nobody is
+using, so the acceptance rate is close to a pure win.
+
+The obvious caveats before this becomes a change: Gemma4 ships no MTP head, so it
+needs either a draft model (which costs weights, and weights are the scarce
+resource here — see A1b) or an EAGLE-style head trained for it; and `ampere/`'s
+H2 is a warning that spec decode can silently cost more than it returns, since a
+one-layer draft head there removed full CUDA graphs from all 64 target layers.
+Gemma currently captures `FULL` graphs, and that must be re-checked, not assumed,
+after any spec-decode change.
 
 ## Version skew: v0.27.1 is the wrong base for this model
 
