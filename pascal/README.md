@@ -774,11 +774,21 @@ gets to be cleverer than the memory bus, and that is where the gap opens.
 #### What is still on the table
 
 - **Prefill attention** is 105.9 ms of a ~635 ms prefill and runs at 13.9% of
-  fp32 peak even after the fp32-operand fix. Flash attention is an algorithm,
-  not a hardware feature -- only its fast implementations need tensor cores and
-  `cp.async` -- so a CUDA version with fp32 accumulate should reach 40%+ and
-  take prefill to roughly 1850 tok/s. This is the largest single inefficiency
-  left anywhere in the system.
+  fp32 peak even after the fp32-operand fix. It is still the largest single
+  inefficiency in the system, but the obvious answer does not work:
+  `pascal/probes/fa_prefill_sm61.cu` is a complete, numerically correct
+  FlashAttention for sm_61 and it *loses* to the tuned Triton kernel (4.094 ms
+  per layer against 4.245 at n=1024, and 1.257 against 1.199 at n=512).
+
+  The reason is a hardware limit rather than a coding one. A thread owning RT
+  rows and CT score columns does RT*CT FMAs per RT+CT shared-memory reads, so
+  the ratio is 2 at RT=CT=4 and 4 at RT=CT=8 -- and 8 is where it would win.
+  RT=8 needs a 128-row query tile, whose staging comes to 64 KiB against
+  Pascal's 48 KiB per-block shared memory, so that configuration cannot be
+  launched. Occupancy is not the explanation: a 32-row tile fits in 28 KiB and
+  admits three blocks per SM instead of two, and is 1.3x *slower*. Beating
+  Triton needs a data flow that keeps Q in registers across the KV sweep, not a
+  bigger tile.
 - **M=17..64** stays on cuBLAS at ~1.6x off its floor. Batch 32 runs 47.3 ms
   against a 15.4 ms bandwidth floor. Closing it needs a real tiled sm_61 SGEMM,
   which would also lift prefill's linear layers.
