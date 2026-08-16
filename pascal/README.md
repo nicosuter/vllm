@@ -691,14 +691,104 @@ trick must be gated on N or it turns a 6.1 ms `lm_head` into 11.3 ms.
 R and MT are measured per M, not derived; `pascal/probes/skinny_gemm_sweep.py`
 carries the sweep.
 
+#### Prefill: `tl.dot` is 2.7x faster if you hand it floats
+
+With decode fixed, a 1024-token prefill profiled as 72% linear layers and **24.5%
+attention** -- 164.9 ms across 28 layers, or 0.73 TFLOP/s against 8.19. Below
+sm_70 Triton lowers `tl.dot` to an FMA loop rather than to an MMA instruction,
+which is the same tax that made the Triton GEMM prototype useless.
+
+The tax is not the lowering. `pascal/probes/tl_dot_rate.py` measures a square
+matmul through `tl.dot` at **1.03 TFLOP/s with fp16 operands and 2.81 with
+fp32** -- and an explicit `.to(tl.float32)` on fp16 operands recovers the whole
+difference, with the data still fp16 in memory. The FMA path was going to
+convert anyway; doing it explicitly is what lets the conversion leave the inner
+loop. There are 228 `tl.dot` call sites in this tree, and this applies to all of
+them.
+
+Applied to attention, with a wider query block, that is 5.888 -> 3.782 ms per
+layer. It is also *more accurate*: the stock path narrows the fp32 accumulator
+to fp16 on the way into the second dot (`P.to(V.dtype)`), which on this card is
+exactly backwards, so V is widened instead -- error against an fp32 reference
+falls from 2.52e-04 to 1.88e-04. The cast doubles the shared memory the dot
+operands need, which caps `TILE_SIZE` at 32 where the fp16 optimum was 64; the
+trade is still worth 122.2 ms against 105.9 ms over 28 layers.
+
+#### Three things in the tail that were not the model
+
+Chasing the last half-millisecond of a decode step turned up two bugs and one
+mystery.
+
+**The shipped compile path never ran on this model.** `_lift_inductor_floor_below_sm70`
+set `TORCHINDUCTOR_WORKER_START=fork` through `os.environ`, but
+`torch._inductor.config` reads that at *its* import time and freezes the answer
+in `worker_start_method` -- which has already happened by the time a platform
+module runs. The default "subprocess" pool therefore started workers that knew
+nothing about the eviction-policy patch, and the default configuration died with
+28 ptxas `.evict_last` errors. Setting the attribute is what takes. Worth 1.15
+tok/s here, and the difference between running and not.
+
+**`functools.cache` cannot appear in a traced region.** A cached `_is_pascal()`
+in the GEMM dispatch failed the whole model compile with "can't handle functions
+not implemented in python" -- dynamo refuses C-implemented wrappers and does not
+fall back. `current_platform.get_device_capability` is `lru_cache`d too, so
+making the flag lazy was not enough; it is resolved at import.
+
+**Sampling one token cost 333 us**, 1.9% of the step. The same kernel with the
+same shape and dtype measures 4 us called on its own, and no argument
+variation -- alignment, slicing, vocabulary size, temperature, the RNG path --
+reproduces it. Bypassing it in the engine really does return 0.33 ms, so it is
+not a profiling artifact either. Doubling `BLOCK_SIZE` recovers nearly all of it
+(56.90 -> 57.41 tok/s, while 256 costs 53.80). The direction is clear; the
+mechanism is not, and is recorded as unexplained rather than guessed at.
+
+### Against llama.cpp
+
+Same card, same weights, same fp16. llama.cpp `b10bf611`, CUDA built for sm_61,
+`llama-bench` for prefill and batch 1 and `llama-batched-bench` above that. The
+GGUF is 3.21 GiB against 1.720 G decode-resident parameters, which is the same
+3.441 GB this fork reads per step -- so both sit under the same roofline.
+
+Decode, tokens/s:
+
+| batch | llama.cpp | vllm-pascal | |
+|---|---|---|---|
+| 1 | 56.67 | 56.70 | 1.00x |
+| 2 | 108.48 | 110.66 | 1.02x |
+| 4 | 130.27 | **208.03** | **1.60x** |
+| 8 | 112.96 | **350.79** | **3.11x** |
+| 16 | 157.46 | **462.52** | **2.94x** |
+| 32 | 299.32 | **676.57** | **2.26x** |
+| 64 | 445.65 | **848.58** | **1.90x** |
+
+Prefill: **1634 tok/s** against llama.cpp's 1590.8 at pp1024 (1634.0 at pp512).
+
+Batch 1 is a dead heat, and that is the expected answer rather than a
+disappointing one: it is a pure bandwidth problem that both engines solve. Of a
+17.62 ms step, 15.81 ms is the GEMM reading 3.441 GB, and that GEMM runs at
+97.5% of this card's measured 223.4 GB/s read ceiling
+(`pascal/probes/read_bandwidth.py`). The absolute ceiling, with a free model and
+no overhead at all, is 64.9 tok/s. Everything above batch 1 is where an engine
+gets to be cleverer than the memory bus, and that is where the gap opens.
+
 #### What is still on the table
 
-- **M=17…64** stays on cuBLAS at ~1.6x off floor. Batch 32 runs 48.8 ms against a
-  16.2 ms bandwidth floor. Closing that needs a real tiled sm_61 SGEMM.
-- **Prefill** is 1477 tok/s against roughly 1900 achievable — it runs M≫32 and
-  never touches this kernel.
-- **Batch-1 overhead** is 2.65 ms/step: rms_norm 0.40, attention 0.34, the
-  sampler's gumbel kernel 0.33, mrope 0.21, then a long tail.
+- **Prefill attention** is 105.9 ms of a ~635 ms prefill and runs at 13.9% of
+  fp32 peak even after the fp32-operand fix. Flash attention is an algorithm,
+  not a hardware feature -- only its fast implementations need tensor cores and
+  `cp.async` -- so a CUDA version with fp32 accumulate should reach 40%+ and
+  take prefill to roughly 1850 tok/s. This is the largest single inefficiency
+  left anywhere in the system.
+- **M=17..64** stays on cuBLAS at ~1.6x off its floor. Batch 32 runs 47.3 ms
+  against a 15.4 ms bandwidth floor. Closing it needs a real tiled sm_61 SGEMM,
+  which would also lift prefill's linear layers.
+- **The decode tail** is 1.81 ms across ~11 small kernels per layer, all
+  latency-bound. Fusing the RMSNorm into the following GEMM is the obvious next
+  cut, worth perhaps 0.2 ms.
+- **Speculative decoding** is now worth far more than it was: a decode step
+  reads the weights once whatever M is, and this fork's M=4 costs 1.11x of M=1
+  where cuBLAS charged 2.5x. Verifying four drafted tokens costs ~19 ms against
+  72.7 ms of serial decoding.
 
 ### Kernel correctness
 
