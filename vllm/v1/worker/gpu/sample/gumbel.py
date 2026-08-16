@@ -212,6 +212,35 @@ def _gumbel_sample_kernel(
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
 
+# Sampling one token from a 151,936-entry vocabulary costs 333 us on sm_61 at
+# the upstream BLOCK_SIZE of 1024 -- 1.9% of an 18 ms decode step, and the
+# largest single item in the tail once the GEMM is at the memory roofline. The
+# same kernel, same shape and dtype, measures 4 us called on its own, so this is
+# not the arithmetic; it is how 149 small blocks behave inside a step that has
+# just streamed 3.4 GB through the cache. Halving the block count is worth
+# 56.90 -> 57.41 tok/s end to end, and 256 (594 blocks) costs 53.80, so the
+# direction is clear even though the mechanism is not.
+#
+# Left alone above sm_70, where 1024 is presumably tuned and a 152k vocabulary
+# is a rounding error against the step.
+_BLOCK_SIZE: int | None = None
+
+
+def _block_size() -> int:
+    global _BLOCK_SIZE
+    if _BLOCK_SIZE is None:
+        from vllm.platforms import current_platform
+
+        capability = (
+            current_platform.get_device_capability()
+            if current_platform.is_cuda()
+            else None
+        )
+        pascal = capability is not None and capability.to_int() < 70
+        _BLOCK_SIZE = 2048 if pascal else 1024
+    return _BLOCK_SIZE
+
+
 def gumbel_sample(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     expanded_idx_mapping: torch.Tensor,  # [num_tokens]
@@ -229,7 +258,7 @@ def gumbel_sample(
     if output_processed_logits_col is not None:
         output_processed_logits_col = output_processed_logits_col.contiguous()
     num_tokens, vocab_size = logits.shape
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = _block_size()
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
     local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
     local_max_dtype = torch.float64 if use_fp64 else torch.float32

@@ -1059,7 +1059,26 @@ def _lift_inductor_floor_below_sm70() -> bool:
     # above: 108 ptxas errors become 12 rather than 0. Forked workers do
     # inherit it, and that beats serialising compilation with
     # TORCHINDUCTOR_COMPILE_THREADS=1. setdefault, so an explicit choice wins.
+    #
+    # The environment variable alone is not enough. `torch._inductor.config`
+    # reads it at *its* import time and freezes the answer in
+    # `worker_start_method`, and by the time this platform module runs that
+    # import has usually already happened -- so the setting is silently ignored
+    # and the default "subprocess" pool starts workers that know nothing about
+    # the patch. That failure is not quiet in its effects but is quiet in its
+    # cause: 28 ptxas `.evict_last` errors and a dead engine, on a card where
+    # `pascal/probes/inductor_sm61.py` reports inductor working. Setting the
+    # already-computed attribute is what actually takes.
     os.environ.setdefault("TORCHINDUCTOR_WORKER_START", "fork")
+    try:
+        import torch._inductor.config as inductor_config
+
+        if inductor_config.worker_start_method == "subprocess":
+            inductor_config.worker_start_method = "fork"
+    except (ImportError, AttributeError):
+        # A torch that has moved this; the env var above is then the only lever
+        # and the ptxas errors will say so.
+        pass
     return True
 
 

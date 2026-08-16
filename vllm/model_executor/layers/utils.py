@@ -3,7 +3,6 @@
 """Utility methods for model layers."""
 
 from collections.abc import Callable
-from functools import cache
 
 import torch
 
@@ -112,12 +111,28 @@ PASCAL_SKINNY_GEMM_WIDE_MAX_M = 32
 PASCAL_SKINNY_GEMM_WIDE_N = 65536
 
 
-@cache
-def _is_pascal() -> bool:
-    if not current_platform.is_cuda():
+# Resolved at import, not on first use, and deliberately not with
+# functools.cache. `dispatch_unquantized_gemm` is called from inside the traced
+# region, and dynamo refuses any C-implemented wrapper there with "can't handle
+# functions not implemented in python" -- which takes the whole model compile
+# down rather than falling back. `functools.cache` is such a wrapper, and so is
+# `current_platform.get_device_capability`, so neither may be reached from a
+# traced frame; resolving here means neither is.
+def _resolve_is_pascal() -> bool:
+    try:
+        if not current_platform.is_cuda():
+            return False
+        capability = current_platform.get_device_capability()
+    except Exception:  # no device, or a platform that cannot answer yet
         return False
-    capability = current_platform.get_device_capability()
     return capability is not None and capability.to_int() < 70
+
+
+_IS_PASCAL = _resolve_is_pascal()
+
+
+def _is_pascal() -> bool:
+    return _IS_PASCAL
 
 
 def _pascal_skinny_gemm_applies(m: int, n: int, k: int, dtype: torch.dtype) -> bool:
