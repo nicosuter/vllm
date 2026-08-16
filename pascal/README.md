@@ -606,6 +606,100 @@ than assuming:
   the gate run took **195 s** end to end (13.7 tok/s), against many minutes cold.
   Faster, not instant.
 
+### Dense fp16: cuBLAS falls off a cliff at M=2, and it costs 2.3x
+
+Everything above is the int4 gate model. A dense **fp16** model is a different
+machine: there is no exllama kernel in the path, every linear layer is
+`torch.nn.functional.linear`, and decode is ~90% of exactly that. The model here
+is `Qwen/Qwen3-VL-Embedding-2B` at fp16 — 1.720 G decode-resident parameters,
+**3.441 GB read per step**, against a measured **212 GB/s** achievable
+(`pascal/probes/fp16_linear_rate.py`). So the batch-1 roofline is 61.7 tok/s and
+the whole question is what fraction of bandwidth the GEMM reaches.
+
+cuBLAS reaches it at M=1 and then stops. Microseconds per call, with `floor` the
+weight bytes divided by 212 GB/s:
+
+| shape | floor | M=1 | M=2 | M=4 | M=8 | M=16 | M=32 |
+|---|---|---|---|---|---|---|---|
+| qkv 2048→4096 | 79 | 82 | 186 | 188 | 191 | 195 | 129 |
+| o 2048→2048 | 40 | 43 | 93 | 94 | 98 | 102 | 82 |
+| gate_up 2048→12288 | 237 | 234 | 552 | 552 | 555 | 555 | 310 |
+| down 6144→2048 | 119 | 128 | 486 | 482 | 490 | 500 | 315 |
+| lm_head 2048→151936 | 2933 | 2832 | 6000 | 6021 | 6038 | 6141 | 11020 |
+
+At M=1 it picks a gemv and lands on the roofline. At M=2 it switches to a
+tensor-core-shaped tile this card cannot feed, loses 2.2–4.1x, and stays there
+through M=16. `lm_head` never recovers. That is not a subtlety in the batching
+curve, it *is* the batching curve: batch 4 measured 2.5x the step time of batch 1
+for 4x the sequences, and batch 32 was faster per step than batch 16.
+
+`csrc/libtorch_stable/quantization/pascal_skinny_gemm.cu` replaces it for
+`M ≤ 16`, and for `M ≤ 32` when N is vocabulary-sized. Same arithmetic, fp32
+accumulate, one pass over the weight:
+
+| shape | M=1 | M=2 | M=4 | M=8 | M=16 | M=32 |
+|---|---|---|---|---|---|---|
+| qkv | 78 | 78 | 80 | 89 | 128 | 240 |
+| down | 116 | 117 | 119 | 135 | 185 | 339 |
+| lm_head | 2792 | 2799 | 2813 | 2892 | 3899 | 8757 |
+
+Decode throughput, `bench.py --graphs full`:
+
+| batch | before | after | |
+|---|---|---|---|
+| 1 | 53.34 | 55.00 | 1.03× |
+| 2 | 46.7 | 106.75 | 2.29× |
+| 4 | 84.53 | **197.68** | **2.34×** |
+| 8 | — | 334.80 | |
+| 16 | 289.02 | **448.66** | **1.55×** |
+| 24 | — | 541.99 | |
+| 32 | 620.89 | 655.37 | 1.06× |
+| 64 | 803.58 | 820.04 | 1.02× |
+
+Batch 1 barely moves because it was already done: `profile_decode.py` puts the
+kernel at **85.3% of device time**, moving 3.441 GB in 15.4 ms — **223 GB/s**,
+above the copy figure, which is what a pure streaming read should beat.
+
+#### Three wrong kernels first, and the one thing they had in common
+
+Triton was tried and abandoned. `tl.dot` is bit-exact on sm_61, but the FMA path
+it lowers to below sm_70 runs at **8% of this card's FMA peak**, which is a third
+of cuBLAS on a path where cuBLAS is itself 2.4x off the roofline.
+`pascal/probes/skinny_gemm.py` keeps that measurement.
+
+Then three CUDA revisions. A `[K, N]` weight layout is structurally attractive —
+it makes `x[m][k]` the same address for every thread, i.e. a broadcast, and it is
+why cuBLAS's own `torch.mm(x, w.t().contiguous())` beats `linear` by 1.3–2.5x
+here — but N/64 threads is not enough parallelism at N=2048, and paying for the
+rest with split-K atomics gave it back.
+
+Every slow revision sat at **0.5–0.6 TFMA/s, 13–15% of peak**, at every tiling,
+every shape, and with zero register spills. That constancy was the answer: not
+bandwidth, not occupancy, not spilling — FMA *latency*. `acc` is both an operand
+and the result, so the innermost loop must walk at least six distinct
+accumulators before returning to one. Eight rows per warp supplied that for free
+at M ≤ 4; at M=16 the accumulator budget forces two, which alternates between two
+chains and stalls four cycles in six.
+
+The fix is to stage MT columns of the activation in registers and put k
+outermost, giving R×MT independent chains for 8×MT extra registers. Worth 1.8x at
+M=16. Two smaller findings came with it: reading the activation as fp16 and
+converting inside the loop beats pre-converting to fp32 (half the L1 bytes, and
+the conversions are free at this instruction mix), and the transposed-cuBLAS
+trick must be gated on N or it turns a 6.1 ms `lm_head` into 11.3 ms.
+
+R and MT are measured per M, not derived; `pascal/probes/skinny_gemm_sweep.py`
+carries the sweep.
+
+#### What is still on the table
+
+- **M=17…64** stays on cuBLAS at ~1.6x off floor. Batch 32 runs 48.8 ms against a
+  16.2 ms bandwidth floor. Closing that needs a real tiled sm_61 SGEMM.
+- **Prefill** is 1477 tok/s against roughly 1900 achievable — it runs M≫32 and
+  never touches this kernel.
+- **Batch-1 overhead** is 2.65 ms/step: rms_norm 0.40, attention 0.34, the
+  sampler's gumbel kernel 0.33, mrope 0.21, then a long tail.
+
 ### Kernel correctness
 
 Coherent text is not proof: a miscompiled kernel usually still reads fine. Each

@@ -117,6 +117,32 @@ def time_generate(llm, n_tokens: int, reps: int, batch: int = 1) -> float:
     return statistics.median(times)
 
 
+_prefill_salt = 0
+
+
+def _unique_prompt_ids(n: int) -> list[int]:
+    """`n` token ids that no earlier call has produced.
+
+    Prefix caching is on by default and it will happily serve a prompt that
+    repeats. The original fixture here was `[100] * n`, which is both a prefix
+    of every longer fixture and identical across repetitions -- so the median
+    of three reps was the median of one cold run and two cache hits, and the
+    slope between two lengths was the slope between two cache hits. That
+    reported 196,472 tok/s at 5.09 us/token, i.e. it measured the block manager.
+
+    A per-call salt in the leading tokens is enough to miss every cached block,
+    since a prefix match must start at token 0. The rest is arbitrary: prefill
+    cost depends on length, not on content.
+    """
+    global _prefill_salt
+    _prefill_salt += 1
+    # Spread the salt over a full 16-token block so no block-aligned prefix of
+    # a previous prompt can match, whatever the block size.
+    return [1000 + ((_prefill_salt * 7919 + i) % 50000) for i in range(16)] + [
+        100
+    ] * (n - 16)
+
+
 def time_prefill(llm, n_prompt_tokens: int, reps: int) -> float:
     """Median wall time to prefill n_prompt_tokens and emit exactly one token.
 
@@ -126,13 +152,11 @@ def time_prefill(llm, n_prompt_tokens: int, reps: int) -> float:
     """
     from vllm import SamplingParams
 
-    # Token 100 is arbitrary but safely inside every vocab here, and content
-    # cannot matter: prefill cost depends on length, not on what was said.
-    prompt = {"prompt_token_ids": [100] * n_prompt_tokens}
     params = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1, ignore_eos=True)
 
     times = []
     for _ in range(reps):
+        prompt = {"prompt_token_ids": _unique_prompt_ids(n_prompt_tokens)}
         start = time.perf_counter()
         llm.generate([prompt], params, use_tqdm=False)
         times.append(time.perf_counter() - start)

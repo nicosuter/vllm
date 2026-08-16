@@ -3,6 +3,7 @@
 """Utility methods for model layers."""
 
 from collections.abc import Callable
+from functools import cache
 
 import torch
 
@@ -96,6 +97,88 @@ def default_unquantized_gemm(
     bias: torch.Tensor | None = None,
 ):
     return torch.nn.functional.linear(x, weight, bias)
+
+
+# Where the sm_61 skinny GEMM stops paying. Below M=16 it beats cuBLAS on every
+# shape in this model; at M=17..32 cuBLAS has recovered on ordinary shapes but is
+# still 3.8x off the bandwidth floor on very wide ones, so those keep the kernel.
+PASCAL_SKINNY_GEMM_MAX_M = 16
+PASCAL_SKINNY_GEMM_WIDE_MAX_M = 32
+
+# "Very wide" is the lm_head-shaped case: N is the vocabulary, tens of times K.
+# cuBLAS spends 11.0 ms there at M=32 against a 2.9 ms floor, and 11.0 ms at
+# M=24, while this kernel spends 8.8 and 6.7. Ordinary projections (N <= 12288
+# here) are the other way round above M=16, hence the two thresholds.
+PASCAL_SKINNY_GEMM_WIDE_N = 65536
+
+
+@cache
+def _is_pascal() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    return capability is not None and capability.to_int() < 70
+
+
+def _pascal_skinny_gemm_applies(m: int, n: int, k: int, dtype: torch.dtype) -> bool:
+    if dtype != torch.float16 or k % 8 != 0 or m < 1:
+        return False
+    if m <= PASCAL_SKINNY_GEMM_MAX_M:
+        return True
+    return m <= PASCAL_SKINNY_GEMM_WIDE_MAX_M and n >= PASCAL_SKINNY_GEMM_WIDE_N
+
+
+def pascal_unquantized_gemm_impl(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Dense fp16 GEMM for sm_61, where cuBLAS picks the wrong kernel below M=32.
+
+    cuBLAS lands on a gemv at M=1 and on a tensor-core-shaped tile at M>=2, which
+    this card cannot feed; it loses 2.2-4.1x of memory bandwidth from M=2 through
+    M=16 and never recovers on lm_head-shaped GEMMs. Since a dense fp16 decode
+    step is ~90% linear layers, that cliff is the whole batching curve.
+    `csrc/libtorch_stable/quantization/pascal_skinny_gemm.cu` carries the
+    measurements and the reasoning.
+    """
+    orig_shape = x.shape
+    x2d = x if x.dim() == 2 else x.reshape(-1, orig_shape[-1])
+    m, k = x2d.shape
+    n = weight.shape[0]
+
+    if not (
+        weight.dtype == torch.float16
+        and weight.is_contiguous()
+        and _pascal_skinny_gemm_applies(m, n, k, x2d.dtype)
+    ):
+        return torch.nn.functional.linear(x, weight, bias)
+
+    out = torch.empty((m, n), dtype=x2d.dtype, device=x2d.device)
+    torch.ops._C.pascal_skinny_gemm(out, x2d.contiguous(), weight)
+    if bias is not None:
+        out = out + bias
+    return out if x.dim() == 2 else out.reshape(*orig_shape[:-1], n)
+
+
+def pascal_unquantized_gemm_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+def pascal_unquantized_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.pascal_unquantized_gemm(x, weight, bias)
+
+
+direct_register_custom_op(
+    op_name="pascal_unquantized_gemm",
+    op_func=pascal_unquantized_gemm_impl,
+    fake_impl=pascal_unquantized_gemm_fake,
+)
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):
@@ -350,5 +433,7 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
         return rocm_unquantized_gemm
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
+    elif _is_pascal():
+        return pascal_unquantized_gemm
     else:
         return default_unquantized_gemm

@@ -331,6 +331,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // conditionally compiled so impl registration is in source file
   ops.def("fp32_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
 
+  // Dense fp16 GEMM for small M on sm_61, where cuBLAS switches to a
+  // tensor-core-shaped tile at M>=2 and loses 2.2-4.1x of memory bandwidth.
+  ops.def(
+      "pascal_skinny_gemm(Tensor! out, Tensor x, Tensor weight) -> ()");
+
   // reorder weight for AllSpark Ampere W8A16 Fused Gemm kernel
   ops.def(
       "rearrange_kn_weight_as_n32k16_order(Tensor b_qweight, Tensor b_scales, "
