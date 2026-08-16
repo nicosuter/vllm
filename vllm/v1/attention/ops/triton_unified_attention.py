@@ -814,7 +814,33 @@ def _get_tile_size(
     return 16 if element_size >= 2 else 32
 
 
-def unified_attention(
+# Latched off the first time the tuned tiles do not fit. Casting the dot
+# operands to float doubles the shared memory they need, and what fits depends
+# on head_size, HEAD_SIZE_PADDED and num_queries_per_kv -- all of which vary by
+# model. Qwen3-VL-Embedding-2B fits at BLOCK_M=32/TILE=32; Qwen3.5-2B asks for
+# 51,200 bytes against Pascal's 49,152 and would take the engine down at the
+# first prefill. Predicting Triton's allocation is guesswork, so this asks and
+# falls back rather than guessing, once per process.
+_pascal_attn_tuning = True
+
+
+def unified_attention(*args, **kwargs):
+    global _pascal_attn_tuning
+    if not _pascal_attn_tuning:
+        return _unified_attention_impl(*args, pascal_tuning=False, **kwargs)
+    try:
+        return _unified_attention_impl(*args, **kwargs)
+    except triton.runtime.errors.OutOfResources:
+        _pascal_attn_tuning = False
+        logger.warning_once(
+            "sm_61 attention tuning needs more shared memory than this device "
+            "has at these shapes; falling back to the stock tiling. Prefill "
+            "attention will be slower."
+        )
+        return _unified_attention_impl(*args, pascal_tuning=False, **kwargs)
+
+
+def _unified_attention_impl(
     q,
     k,
     v,
@@ -862,6 +888,7 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    pascal_tuning: bool = True,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -967,7 +994,8 @@ def unified_attention(
     # fp16-operand optimum was 64. Trading the wider tile for the faster dot is
     # worth it: 122.2 ms against 105.9 ms over 28 layers.
     pascal_prefill_tiling = (
-        max_seqlen_q > 1
+        pascal_tuning
+        and max_seqlen_q > 1
         and head_size <= 128
         and 1 < num_queries_per_kv <= 32
         and current_platform.is_cuda()
@@ -983,7 +1011,8 @@ def unified_attention(
     # where tl.dot becomes an MMA instruction -- but there it would cost the
     # MMA, so it is gated on the same floor.
     dot_fp32 = (
-        current_platform.is_cuda()
+        pascal_tuning
+        and current_platform.is_cuda()
         and (_cap2 := current_platform.get_device_capability()) is not None
         and _cap2.to_int() < 70
     )
