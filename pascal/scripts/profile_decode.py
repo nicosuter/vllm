@@ -29,7 +29,8 @@ PROMPT = "Explain how a CPU scheduler decides which thread to run next."
 
 
 def run_profile(model: str, out_dir: str, max_tokens: int,
-                dtype: str = "auto", backend: str = "none") -> None:
+                dtype: str = "auto", backend: str = "none",
+                prompt_tokens: int = 0) -> None:
     if backend == "inductor":
         # Same lift the probe uses, so there is one definition of it.
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "probes"))
@@ -73,12 +74,22 @@ def run_profile(model: str, out_dir: str, max_tokens: int,
         temperature=0.0, max_tokens=max_tokens, min_tokens=max_tokens, ignore_eos=True
     )
 
+    # A synthetic prompt of an exact length, for isolating prefill. Salted per
+    # call because prefix caching would otherwise serve the profiled run from
+    # the warm-up's blocks and the trace would contain no prefill at all.
+    def make_prompt(salt: int):
+        if not prompt_tokens:
+            return PROMPT
+        head = [1000 + ((salt * 7919 + i) % 50000) for i in range(16)]
+        return {"prompt_token_ids": head + [100] * (prompt_tokens - 16)}
+
     # Warm up outside the profile so Triton's per-shape JIT does not land in the
     # trace and swamp every real kernel.
-    llm.generate([PROMPT], SamplingParams(temperature=0.0, max_tokens=8), use_tqdm=False)
+    llm.generate([make_prompt(1)], SamplingParams(temperature=0.0, max_tokens=8),
+                 use_tqdm=False)
 
     llm.start_profile()
-    llm.generate([PROMPT], params, use_tqdm=False)
+    llm.generate([make_prompt(2)], params, use_tqdm=False)
     llm.stop_profile()
 
     # The worker flushes the trace on stop_profile, but the write is async.
@@ -123,19 +134,28 @@ def summarize(out_dir: str, top: int) -> int:
     for name, dur in sorted(by_name.items(), key=lambda kv: -kv[1])[:top]:
         print(f"{dur:12.0f} {100 * dur / total:5.1f}% {counts[name]:7d}  {name[:70]}")
 
-    # The question this script exists to answer: how much of the step is the
-    # quantized GEMM, i.e. how much headroom a dp4a rewrite could possibly have.
-    gemm = sum(d for n, d in by_name.items() if "gemm_half_q_half" in n or "q4" in n.lower())
-    attn = sum(
-        d
-        for n, d in by_name.items()
-        if "attention" in n.lower() or "gated_delta" in n.lower() or "conv1d" in n.lower()
-    )
+    # Buckets, because "which kernel is slowest" is rarely the question. What
+    # matters is how much of the step is the linear layers -- whose floor is
+    # known exactly, being the weight bytes over the memory bandwidth -- and how
+    # much is the tail around them, which is where the batch-1 gap to llama.cpp
+    # lives once the GEMM is at the roofline.
+    def bucket(pred) -> float:
+        return sum(d for n, d in by_name.items() if pred(n.lower()))
+
+    gemm = bucket(lambda n: "skinny_gemm" in n or "gemm" in n or "gemv" in n
+                  or "gemm_half_q_half" in n or "cutlass" in n or "sgemm" in n)
+    attn = bucket(lambda n: "attention" in n or "gated_delta" in n or "conv1d" in n)
+    norm = bucket(lambda n: "rms_norm" in n or "layernorm" in n or "typeconvert" in n)
+    rope = bucket(lambda n: "rope" in n or "rotary" in n)
+    sample = bucket(lambda n: "gumbel" in n or "sampl" in n or "topk" in n
+                    or "penalt" in n)
+    tail = total - gemm - attn - norm - rope - sample
+
     print("\n" + "-" * 100)
-    print(f"quantized GEMM (exllama): {gemm / 1000:8.1f} ms  {100 * gemm / total:5.1f}%")
-    print(f"attention + GDN + conv1d: {attn / 1000:8.1f} ms  {100 * attn / total:5.1f}%")
-    print(f"everything else:          {(total - gemm - attn) / 1000:8.1f} ms  "
-          f"{100 * (total - gemm - attn) / total:5.1f}%")
+    for label, val in (("linear layers (GEMM)", gemm), ("attention", attn),
+                       ("norms", norm), ("rope", rope), ("sampling", sample),
+                       ("everything else", tail)):
+        print(f"{label:<24} {val / 1000:8.1f} ms  {100 * val / total:5.1f}%")
     return 0
 
 
@@ -144,6 +164,13 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--out-dir", default="/work/profile")
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=0,
+        help="feed a synthetic prompt of exactly this many tokens; with "
+        "--max-tokens 1 the trace is almost entirely prefill",
+    )
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--dtype", default="auto")
     ap.add_argument(
@@ -163,7 +190,7 @@ def main() -> int:
     os.makedirs(args.out_dir, exist_ok=True)
     if not args.summarize_only:
         run_profile(args.model, args.out_dir, args.max_tokens, args.dtype,
-                    args.backend)
+                    args.backend, args.prompt_tokens)
     return summarize(args.out_dir, args.top)
 
 

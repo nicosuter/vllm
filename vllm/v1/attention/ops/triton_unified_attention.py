@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
 from typing import Any
 
 import torch
@@ -236,6 +237,7 @@ def kernel_unified_attention(
     BLOCK_Q: tl.constexpr,
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,
+    DOT_FP32: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
     USE_FP8: tl.constexpr,
     # Toggles 2D vs 3D layout.  The 2D path runs the full sequence in one
@@ -534,12 +536,19 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+        # Below sm_70 tl.dot lowers to an FMA loop, and that loop is 2.7x
+        # faster given float operands than fp16 ones -- 2.81 TFLOP/s against
+        # 1.03 on this card (pascal/probes/tl_dot_rate.py). The tiles stay fp16
+        # in memory and in shared memory; only the values handed to tl.dot are
+        # converted, which the FMA path was going to do anyway, just worse.
+        Q_d = Q.to(tl.float32) if DOT_FP32 else Q
+        K_d = K.to(tl.float32) if DOT_FP32 else K
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-            S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
+            S += tl.dot(Q_d, K_d) * (score_scale * k_token_head_scales[None, :])
         else:
-            S += score_scale * tl.dot(Q, K)
+            S += score_scale * tl.dot(Q_d, K_d)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -578,8 +587,14 @@ def kernel_unified_attention(
             V = tl.where(sw_mask_v, V, 0.0)
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
+            if DOT_FP32:
+                acc += tl.dot(P * v_token_head_scales[None, :], V.to(tl.float32))
+            else:
+                acc += tl.dot((P * v_token_head_scales[None, :]).to(V.dtype), V)
+        elif DOT_FP32:
+            # P is already float; the usual path narrows it to V's dtype, which
+            # is exactly the wrong direction here. Widen V instead.
+            acc += tl.dot(P, V.to(tl.float32))
         else:
             acc += tl.dot(P.to(V.dtype), V)
 
@@ -938,6 +953,51 @@ def unified_attention(
     launch_num_warps: int | None = None
     launch_num_stages: int | None = None
 
+    # Below sm_70 Triton lowers tl.dot to its FMA path rather than to an MMA
+    # instruction, and the defaults here were sized for the latter. With
+    # num_queries_per_kv=2 they come out at a 16x32x128 dot, which is too small
+    # to amortise an FMA inner loop over: measured 5.888 ms per layer at a
+    # 1024-token prefill, 0.73 TFLOP/s against this card's 8.19 peak. Twice the
+    # query rows, with the fp32 operands below, gets that to 3.782 ms.
+    #
+    # Prefill only. Decode attention is already 0.03 ms per layer and none of
+    # these combinations move it. The ceiling is 48 KB of shared memory at
+    # HEAD_SIZE_PADDED=128, and casting the dot operands to float doubles what
+    # they need there -- which is why this stays at TILE_SIZE 32 while the
+    # fp16-operand optimum was 64. Trading the wider tile for the faster dot is
+    # worth it: 122.2 ms against 105.9 ms over 28 layers.
+    pascal_prefill_tiling = (
+        max_seqlen_q > 1
+        and head_size <= 128
+        and 1 < num_queries_per_kv <= 32
+        and current_platform.is_cuda()
+        and (_cap := current_platform.get_device_capability()) is not None
+        and _cap.to_int() < 70
+    )
+    if pascal_prefill_tiling:
+        BLOCK_M = 32
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 4
+
+    # The fp32-operand trick above is not prefill-specific and costs nothing
+    # where tl.dot becomes an MMA instruction -- but there it would cost the
+    # MMA, so it is gated on the same floor.
+    dot_fp32 = (
+        current_platform.is_cuda()
+        and (_cap2 := current_platform.get_device_capability()) is not None
+        and _cap2.to_int() < 70
+    )
+    if (_dot_tune := os.environ.get("VLLM_PASCAL_ATTN_DOT_FP32")) is not None:
+        dot_fp32 = _dot_tune == "1"
+
+    # Tuning hook for pascal/probes/attention_tiling.py, which is what chose the
+    # numbers above. Not a supported switch.
+    _tune = os.environ.get("VLLM_PASCAL_ATTN_BLOCK_M")
+    if _tune:
+        BLOCK_M = int(_tune)
+        BLOCK_Q = max(1, BLOCK_M // num_queries_per_kv)
+        launch_num_warps = int(os.environ.get("VLLM_PASCAL_ATTN_WARPS", "4"))
+
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
@@ -951,7 +1011,7 @@ def unified_attention(
     if tuned_large_head:
         BLOCK_M = 32
         BLOCK_Q = BLOCK_M // num_queries_per_kv
-        launch_num_warps = 8
+        launch_num_warps = 4
         launch_num_stages = 2
 
     # Ideally we would launch with kernel with:
@@ -981,6 +1041,11 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+    if pascal_prefill_tiling:
+        TILE_SIZE_PREFILL = 32
+    if _tune:
+        TILE_SIZE_PREFILL = int(os.environ.get("VLLM_PASCAL_ATTN_TILE", "32"))
+        TILE_SIZE_DECODE = TILE_SIZE_PREFILL
 
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
@@ -1153,6 +1218,7 @@ def unified_attention(
         BLOCK_Q=BLOCK_Q,
         num_seqs=num_seqs,
         BLOCK_M=BLOCK_M,
+        DOT_FP32=dot_fp32,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
