@@ -13,6 +13,14 @@ name: Build Pascal image
 #
 # Publishing a GitHub release from an *existing* tag does not push a new tag and
 # so does not trigger this; use the manual run for that.
+#
+# There is no smoke-test step here on purpose. The check lives at the end of the
+# runtime stage in pascal/docker/Dockerfile, which is strictly stronger: a
+# failure aborts the build, so a broken image is never pushed at all, whereas a
+# workflow step can only go red after the push has happened. It also costs no
+# extra disk, which matters -- see "Free disk space" below for how tight the
+# runner already is, and `load: true` here would mean a second copy of a
+# multi-GB image.
 
 on:
   push:

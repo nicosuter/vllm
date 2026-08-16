@@ -114,5 +114,34 @@ ENV TRITON_CACHE_DIR=/cache/triton
 ENV HF_HOME=/cache/hf
 VOLUME ["/cache"]
 
+# Smoke-check the RUNTIME stage, so an image that cannot serve is never pushed.
+#
+# Two shipped tags could not start any model -- no C compiler, and cu13
+# torchaudio/torchcodec wheels in a cu126 image -- and CI was green for both,
+# because nothing here ever ran the runtime image. pascal/MODELS.md is measured
+# in the build pod, which is the devel stage and carries a toolchain this stage
+# does not, so the gap was invisible from both sides.
+#
+# Deliberately NOT `vllm --help`: that constructs VllmConfig, which infers a
+# device and fails with "Failed to infer device type" on any machine without a
+# GPU, including every CI runner. Importing the CLI module is the part that
+# breaks on a bad wheel -- it is the exact path that died, entrypoints/cli/main
+# -> benchmark -> transformers -> torchaudio -> libcudart.so.13 -- and it needs
+# no GPU. What cannot be checked here is the Triton JIT itself, which only
+# happens on a real card; the compiler's presence is the closest invariant, so
+# it is asserted by compiling rather than by `command -v`.
+RUN set -eu; \
+    printf 'int main(void){return 0;}\n' > /tmp/cc-probe.c; \
+    cc /tmp/cc-probe.c -o /tmp/cc-probe \
+      || { echo "SMOKE FAIL: no working C compiler; Triton JITs at run time and needs one"; exit 1; }; \
+    rm -f /tmp/cc-probe /tmp/cc-probe.c; \
+    python -c "import sysconfig, os, sys; \
+c = [sysconfig.get_config_var('INCLUDEPY'), sysconfig.get_paths()['include']]; \
+h = [os.path.join(d, 'Python.h') for d in c if d]; \
+sys.exit(0) if any(os.path.exists(p) for p in h) else (print('SMOKE FAIL: no Python.h in ' + repr(c)), sys.exit(1))"; \
+    python -c "import vllm.entrypoints.cli.main" \
+      || { echo "SMOKE FAIL: vLLM CLI import chain is broken (check for cu13 wheels)"; exit 1; }; \
+    echo "smoke: cc + Python headers + vLLM CLI import all OK"
+
 ENTRYPOINT ["vllm"]
 CMD ["--help"]
